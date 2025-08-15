@@ -345,8 +345,11 @@ def callback():
         r = requests.post("https://discord.com/api/oauth2/token", data=token_data, headers=headers, timeout=8)
         r.raise_for_status()
         creds = r.json()
-        if creds.get("scope") != SCOPE:
-            print(f"[OAuth] Invalid scope: expected {SCOPE}, got {creds.get('scope')}")
+        # Check scopes as a set to ignore order
+        expected_scopes = set(SCOPE.split())
+        received_scopes = set(creds.get("scope", "").split())
+        if not expected_scopes.issubset(received_scopes):
+            print(f"[OAuth] Invalid scope: expected {expected_scopes}, got {received_scopes}")
             return "Invalid OAuth scope", 400
     except Exception as e:
         print(f"[OAuth] Token exchange failed: {e}")
