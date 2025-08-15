@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import threading
 import asyncio
 from datetime import datetime
 from urllib.parse import urlencode
@@ -13,7 +14,6 @@ import stripe
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential
 from dotenv import load_dotenv
-import sys
 
 load_dotenv()
 
@@ -135,7 +135,7 @@ def remove_assignment_from_sheet(row_id):
     print(f"[Sheets] Removed assignment row_id={row_id}")
 
 # ------------------------------
-# Discord Bot Setup (Background Worker)
+# Discord Bot Setup
 # ------------------------------
 intents = discord.Intents.default()
 intents.members = True
@@ -224,12 +224,26 @@ async def queue_processor_loop():
             print(f"[Worker] Unexpected error in queue loop: {e}")
             await asyncio.sleep(5)
 
-def run_bot():
-    print("[Startup] Running in BOT mode (Background Worker)")
-    bot.run(DISCORD_BOT_TOKEN)
+def schedule_immediate_processing():
+    try:
+        if bot.is_ready():
+            bot.loop.call_soon_threadsafe(lambda: bot.loop.create_task(_wake_queue_once()))
+        else:
+            print("[Scheduler] Bot not ready, deferring immediate processing")
+            bot.loop.create_task(_wake_queue_once())
+    except Exception as e:
+        print(f"[Scheduler] Failed to schedule immediate processing: {e}")
+
+async def _wake_queue_once():
+    assignments = get_pending_assignments_from_sheet(limit=50)
+    if not assignments:
+        print("[Scheduler] No pending assignments to process")
+        return
+    tasks = [asyncio.create_task(process_assignment_row(assignment)) for assignment in assignments]
+    await asyncio.gather(*tasks)
 
 # ------------------------------
-# Flask App (Web Service)
+# Flask App
 # ------------------------------
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY
@@ -380,7 +394,9 @@ def stripe_webhook():
         except Exception as e:
             print(f"[Stripe] Failed to update sheet for email={email}: {e}")
             return jsonify({"status": "error", "message": "Failed to update sheet"}), 500
-        add_assignment_to_sheet(discord_id, plan, "assign", email, stripe_subscription_id)
+        row_id = add_assignment_to_sheet(discord_id, plan, "assign", email, stripe_subscription_id)
+        if row_id:
+            schedule_immediate_processing()
         return jsonify({"status": "success"}), 200
     elif ev_type == "customer.subscription.deleted":
         subscription = event["data"]["object"]
@@ -395,7 +411,9 @@ def stripe_webhook():
         except Exception as e:
             print(f"[Stripe] Failed to update sheet for subscription_id={stripe_subscription_id}: {e}")
             return jsonify({"status": "error", "message": "Failed to update sheet"}), 500
-        add_assignment_to_sheet(discord_id, plan, "remove", email, stripe_subscription_id)
+        row_id = add_assignment_to_sheet(discord_id, plan, "remove", email, stripe_subscription_id)
+        if row_id:
+            schedule_immediate_processing()
         return jsonify({"status": "success"}), 200
     elif ev_type == "invoice.payment_failed":
         invoice = event["data"]["object"]
@@ -404,25 +422,23 @@ def stripe_webhook():
             email, discord_id, plan = lookup_by_subscription_id(stripe_subscription_id)
             if all([email, discord_id, plan]):
                 print(f"[Stripe] Payment failed for subscription {stripe_subscription_id}; queuing removal")
-                add_assignment_to_sheet(discord_id, plan, "remove", email, stripe_subscription_id)
+                row_id = add_assignment_to_sheet(discord_id, plan, "remove", email, stripe_subscription_id)
+                if row_id:
+                    schedule_immediate_processing()
         return jsonify({"status": "handled"}), 200
     print(f"[Stripe] Ignored event: {ev_type}")
     return jsonify({"status": "ignored"}), 200
 
-def run_flask():
-    port = int(os.environ.get("PORT", 5000))
-    print(f"[Startup] Running in WEB mode (Web Service) on port {port}")
-    app.run(host="0.0.0.0", port=port)
-
 # ------------------------------
 # Startup Wiring
 # ------------------------------
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    print(f"[Startup] Starting Flask server on port {port}")
+    app.run(host="0.0.0.0", port=port)
+
 if __name__ == "__main__":
     validate_env_vars()
-    mode = sys.argv[1] if len(sys.argv) > 1 else os.getenv("MODE", "web")
-    if mode == "web":
-        run_flask()
-    elif mode == "bot":
-        run_bot()
-    else:
-        raise ValueError(f"[Startup] Invalid MODE: {mode}. Use 'web' or 'bot'.")
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    bot.run(DISCORD_BOT_TOKEN)
