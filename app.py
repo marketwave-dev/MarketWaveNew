@@ -63,9 +63,9 @@ PLAN_TO_ROLE = {
     "MarketWave Plus": ROLE_PLUS,
 }
 PLAN_TO_PRICE_ID = {
-    "5K to 50K Challenge": "price_1RdEoc08Ntv6wEBmUZOADdMd",  # Replace with your Stripe Price ID
-    "MarketWave Elite": "price_1RdEob08Ntv6wEBmT27qALuM",     # Replace with your Stripe Price ID
-    "MarketWave Plus": "price_1RdEoc08Ntv6wEBmifMeruFq"       # Replace with your Stripe Price ID
+    "5K to 50K Challenge": "price_1RdEoc08Ntv6wEBmUZOADdMd",
+    "MarketWave Elite": "price_1RdEob08Ntv6wEBmT27qALuM",
+    "MarketWave Plus": "price_1RdEoc08Ntv6wEBmifMeruFq"
 }
 
 # ------------------------------
@@ -202,8 +202,7 @@ async def process_assignment_row(assignment):
         await asyncio.sleep(backoff)
     success, err = await assign_or_remove_role(discord_id, plan, action)
     if success:
-        print(f"[Success] row_id={row_id} discord_id={discor
-d_id} plan={plan} action={action}")
+        print(f"[Success] row_id={row_id} discord_id={discord_id} plan={plan} action={action}")
         remove_assignment_from_sheet(row_id)
     else:
         error_text = f"{datetime.utcnow().isoformat()} | {err}"
