@@ -56,11 +56,16 @@ MAX_ATTEMPTS = 5
 INITIAL_BACKOFF = 2  # seconds
 BACKOFF_MULTIPLIER = 2
 
-# Maps plan name -> role id
+# Maps plan name -> role id and Stripe price ID
 PLAN_TO_ROLE = {
     "5K to 50K Challenge": ROLE_5K_TO_50K,
     "MarketWave Elite": ROLE_ELITE,
     "MarketWave Plus": ROLE_PLUS,
+}
+PLAN_TO_PRICE_ID = {
+    "5K to 50K Challenge": "price_1RdEoc08Ntv6wEBmUZOADdMd",  # Replace with your Stripe Price ID
+    "MarketWave Elite": "price_1RdEob08Ntv6wEBmT27qALuM",     # Replace with your Stripe Price ID
+    "MarketWave Plus": "price_1RdEoc08Ntv6wEBmifMeruFq"       # Replace with your Stripe Price ID
 }
 
 # ------------------------------
@@ -71,7 +76,6 @@ def add_assignment_to_sheet(discord_id, plan, action, email=None, stripe_subscri
     if plan not in PLAN_TO_ROLE:
         print(f"[Sheets] Invalid plan: {plan}")
         return None
-    # Check for duplicates
     pending = get_pending_assignments_from_sheet(limit=100)
     for assignment in pending:
         if (assignment['discord_id'] == str(discord_id) and
@@ -198,7 +202,8 @@ async def process_assignment_row(assignment):
         await asyncio.sleep(backoff)
     success, err = await assign_or_remove_role(discord_id, plan, action)
     if success:
-        print(f"[Success] row_id={row_id} discord_id={discord_id} plan={plan} action={action}")
+        print(f"[Success] row_id={row_id} discord_id={discor
+d_id} plan={plan} action={action}")
         remove_assignment_from_sheet(row_id)
     else:
         error_text = f"{datetime.utcnow().isoformat()} | {err}"
@@ -345,7 +350,6 @@ def callback():
         r = requests.post("https://discord.com/api/oauth2/token", data=token_data, headers=headers, timeout=8)
         r.raise_for_status()
         creds = r.json()
-        # Check scopes as a set to ignore order
         expected_scopes = set(SCOPE.split())
         received_scopes = set(creds.get("scope", "").split())
         if not expected_scopes.issubset(received_scopes):
@@ -364,12 +368,27 @@ def callback():
         print(f"[OAuth] Failed to fetch user info: {e}")
         return "Failed to fetch user info", 500
     print(f"[OAuth] Success: discord_id={discord_id} email={email} plan={plan}")
+    # Create Stripe checkout session
     try:
-        update_subscription_sheet(email, discord_id, plan, "linked")
+        checkout_session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            line_items=[
+                {
+                    "price": PLAN_TO_PRICE_ID[plan],
+                    "quantity": 1,
+                }
+            ],
+            mode="subscription",
+            success_url="https://marketwavetrading.com/success",
+            cancel_url="https://marketwavetrading.com/cancel",
+            metadata={"plan": plan, "discord_id": discord_id},
+            customer_email=email,
+        )
+        print(f"[Stripe] Created checkout session for discord_id={discord_id} plan={plan}")
+        return redirect(checkout_session.url)
     except Exception as e:
-        print(f"[OAuth] Failed to update sheet: {e}")
-        return "Failed to update Google Sheet", 500
-    return redirect("https://marketwavetrading.com/success")
+        print(f"[Stripe] Failed to create checkout session: {e}")
+        return "Failed to create checkout session", 500
 
 @app.route("/webhook", methods=["POST"])
 @limiter.limit("100 per minute")
@@ -388,14 +407,11 @@ def stripe_webhook():
         email = session_obj.get("customer_details", {}).get("email", "")
         stripe_customer_id = session_obj.get("customer")
         plan = session_obj.get("metadata", {}).get("plan", None)
+        discord_id = session_obj.get("metadata", {}).get("discord_id")
         stripe_subscription_id = session_obj.get("subscription")
-        if not email or not plan or plan not in PLAN_TO_ROLE:
-            print(f"[Stripe] Invalid data in checkout.session.completed: email={email} plan={plan}")
-            return jsonify({"status": "error", "message": "Invalid email or plan"}), 400
-        discord_id, existing_plan = lookup_by_email(email)
-        if not discord_id or existing_plan != plan:
-            print(f"[Stripe] Invalid lookup for email={email}: discord_id={discord_id}, existing_plan={existing_plan}, expected_plan={plan}")
-            return jsonify({"status": "error", "message": "No Discord ID or plan mismatch"}), 400
+        if not email or not plan or plan not in PLAN_TO_ROLE or not discord_id:
+            print(f"[Stripe] Invalid data in checkout.session.completed: email={email} plan={plan} discord_id={discord_id}")
+            return jsonify({"status": "error", "message": "Invalid email, plan, or discord_id"}), 400
         try:
             update_subscription_sheet(email, discord_id, plan, "active", stripe_customer_id, stripe_subscription_id)
         except Exception as e:
