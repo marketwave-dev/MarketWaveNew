@@ -1,65 +1,60 @@
-"""
-Bulletproof Discord role assignment service (single-file)
-
-Features:
-- Flask web app for OAuth + Stripe webhook endpoints
-- Discord bot with members intent
-- Immediate role assignment after OAuth (and after Stripe events)
-- Robust retry logic with exponential backoff (async)
-- Persistent retry queue using SQLite so retries survive restarts
-- Detailed logging for every step (successes, failures, retries)
-- Confirmation check after assigning/removing a role
-- Periodic background worker that processes the queue
-
-Notes:
-- Make sure the following environment variables are set:
-  DISCORD_BOT_TOKEN, DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_REDIRECT_URI,
-  DISCORD_GUILD_ID, ROLE_5K_TO_50K, ROLE_ELITE, ROLE_PLUS,
-  STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, GOOGLE_APPS_SCRIPT_URL,
-  FLASK_SECRET_KEY (optional)
-- Deploy this script as your app entrypoint (e.g., app.py)
-"""
-
 import os
 import json
-import sqlite3
 import time
-import threading
-import requests
 import asyncio
 from datetime import datetime
 from urllib.parse import urlencode
 from flask import Flask, request, redirect, session, jsonify
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import discord
 from discord.ext import commands
+import stripe
+import requests
+from tenacity import retry, stop_after_attempt, wait_exponential
 from dotenv import load_dotenv
+import sys
 
 load_dotenv()
 
 # ------------------------------
 # Environment / Configuration
 # ------------------------------
+REQUIRED_ENV_VARS = [
+    "DISCORD_BOT_TOKEN", "DISCORD_CLIENT_ID", "DISCORD_CLIENT_SECRET",
+    "DISCORD_REDIRECT_URI", "DISCORD_GUILD_ID", "ROLE_5K_TO_50K",
+    "ROLE_ELITE", "ROLE_PLUS", "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET",
+    "GOOGLE_APPS_SCRIPT_URL", "FLASK_SECRET_KEY"
+]
+
+def validate_env_vars():
+    missing = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
+    if missing:
+        raise EnvironmentError(f"[Startup] Missing required environment variables: {', '.join(missing)}")
+    try:
+        int(os.getenv("DISCORD_GUILD_ID"))
+        for role in ["ROLE_5K_TO_50K", "ROLE_ELITE", "ROLE_PLUS"]:
+            int(os.getenv(role))
+    except ValueError:
+        raise EnvironmentError("[Startup] Invalid role or guild ID format")
+
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
-DISCORD_GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", "0"))
-
-# Roles (discord role IDs)
-ROLE_5K_TO_50K = int(os.getenv("ROLE_5K_TO_50K", "0"))
-ROLE_ELITE = int(os.getenv("ROLE_ELITE", "0"))
-ROLE_PLUS = int(os.getenv("ROLE_PLUS", "0"))
-
+DISCORD_GUILD_ID = int(os.getenv("DISCORD_GUILD_ID"))
+ROLE_5K_TO_50K = int(os.getenv("ROLE_5K_TO_50K"))
+ROLE_ELITE = int(os.getenv("ROLE_ELITE"))
+ROLE_PLUS = int(os.getenv("ROLE_PLUS"))
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 GOOGLE_APPS_SCRIPT_URL = os.getenv("GOOGLE_APPS_SCRIPT_URL")
+FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY")
 
 # Tuneable retry settings
 MAX_ATTEMPTS = 5
 INITIAL_BACKOFF = 2  # seconds
 BACKOFF_MULTIPLIER = 2
-
-DATABASE_PATH = os.getenv("ASSIGNMENT_DB_PATH", "assignment_queue.db")
 
 # Maps plan name -> role id
 PLAN_TO_ROLE = {
@@ -68,218 +63,178 @@ PLAN_TO_ROLE = {
     "MarketWave Plus": ROLE_PLUS,
 }
 
-# Stripe price ids - keep if you use checkout session creation in callback
-PLAN_TO_PRICE_ID = {
-    "MarketWave Plus": "price_1RdEoc08Ntv6wEBmifMeruFq",
-    "MarketWave Elite": "price_1RdEob08Ntv6wEBmT27qALuM",
-    "5K to 50K Challenge": "price_1RdEoc08Ntv6wEBmUZOADdMd"
-}
-
 # ------------------------------
-# SQLite queue persistence
+# Google Sheets Queue Functions
 # ------------------------------
-def init_db():
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS assignments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            discord_id TEXT NOT NULL,
-            plan TEXT NOT NULL,
-            action TEXT NOT NULL, -- 'assign' or 'remove'
-            email TEXT,
-            stripe_subscription_id TEXT,
-            attempts INTEGER DEFAULT 0,
-            last_error TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )"""
-    )
-    conn.commit()
-    conn.close()
-
-def add_assignment_to_db(discord_id, plan, action, email=None, stripe_subscription_id=None):
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO assignments (discord_id, plan, action, email, stripe_subscription_id) VALUES (?, ?, ?, ?, ?)",
-        (str(discord_id), plan, action, email, stripe_subscription_id)
-    )
-    conn.commit()
-    row_id = c.lastrowid
-    conn.close()
-    print(f"[DB] Queued assignment id={row_id} discord_id={discord_id} plan={plan} action={action}")
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def add_assignment_to_sheet(discord_id, plan, action, email=None, stripe_subscription_id=None):
+    if plan not in PLAN_TO_ROLE:
+        print(f"[Sheets] Invalid plan: {plan}")
+        return None
+    # Check for duplicates
+    pending = get_pending_assignments_from_sheet(limit=100)
+    for assignment in pending:
+        if (assignment['discord_id'] == str(discord_id) and
+            assignment['plan'] == plan and
+            assignment['action'] == action and
+            assignment['attempts'] < MAX_ATTEMPTS):
+            print(f"[Sheets] Skipped duplicate assignment for discord_id={discord_id} plan={plan} action={action}")
+            return None
+    payload = {
+        "action": "insert_assignment",
+        "data": {
+            "email": email,
+            "discord_id": str(discord_id),
+            "plan": plan,
+            "status": "pending",
+            "action": action,
+            "stripe_subscription_id": stripe_subscription_id,
+            "attempts": 0,
+            "last_error": None,
+            "created_at": datetime.now().isoformat(),
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+    }
+    r = requests.post(GOOGLE_APPS_SCRIPT_URL, json=payload, timeout=8)
+    r.raise_for_status()
+    response = r.json()
+    row_id = response.get("row_id")
+    print(f"[Sheets] Queued assignment row_id={row_id} discord_id={discord_id} plan={plan} action={action} email={email}")
     return row_id
 
-def get_pending_assignments(limit=50):
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    c.execute("SELECT id, discord_id, plan, action, email, stripe_subscription_id, attempts FROM assignments ORDER BY created_at ASC LIMIT ?", (limit,))
-    rows = c.fetchall()
-    conn.close()
-    return rows
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def get_pending_assignments_from_sheet(limit=50):
+    r = requests.get(GOOGLE_APPS_SCRIPT_URL, params={"action": "get_pending_assignments", "limit": limit}, timeout=8)
+    r.raise_for_status()
+    assignments = r.json().get("assignments", [])
+    print(f"[Sheets] Fetched {len(assignments)} pending assignments")
+    return assignments
 
-def increment_attempts_and_log_error(row_id, error_text):
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE assignments SET attempts = attempts + 1, last_error = ? WHERE id = ?", (error_text, row_id))
-    conn.commit()
-    conn.close()
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def increment_attempts_and_log_error_in_sheet(row_id, error_text):
+    payload = {
+        "action": "update_assignment",
+        "row_id": row_id,
+        "updates": {
+            "attempts": "increment",
+            "last_error": error_text
+        }
+    }
+    r = requests.post(GOOGLE_APPS_SCRIPT_URL, json=payload, timeout=8)
+    r.raise_for_status()
+    print(f"[Sheets] Updated assignment row_id={row_id} with error: {error_text}")
 
-def remove_assignment(row_id):
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM assignments WHERE id = ?", (row_id,))
-    conn.commit()
-    conn.close()
-    print(f"[DB] Removed assignment id={row_id}")
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def remove_assignment_from_sheet(row_id):
+    payload = {
+        "action": "remove_assignment",
+        "row_id": row_id
+    }
+    r = requests.post(GOOGLE_APPS_SCRIPT_URL, json=payload, timeout=8)
+    r.raise_for_status()
+    print(f"[Sheets] Removed assignment row_id={row_id}")
 
 # ------------------------------
-# Discord bot setup
+# Discord Bot Setup (Background Worker)
 # ------------------------------
 intents = discord.Intents.default()
-intents.members = True  # required to fetch members reliably
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
     print(f"[Discord] Bot logged in as {bot.user} (id={bot.user.id})")
-    # start the background worker once bot is ready
     bot.loop.create_task(queue_processor_loop())
 
-# Core worker: attempts to assign or remove a role and confirms
 async def assign_or_remove_role(discord_id: str, plan: str, action: str):
-    """
-    Returns (True, None) on success.
-    Returns (False, "error message") on failure.
-    """
+    if plan not in PLAN_TO_ROLE:
+        return False, f"No role mapping for plan '{plan}'"
     guild = bot.get_guild(DISCORD_GUILD_ID)
     if not guild:
         return False, f"Guild {DISCORD_GUILD_ID} not found"
-
     try:
-        # fetch_member bypasses cache and ensures we have the current member object
         member = await guild.fetch_member(int(discord_id))
     except discord.NotFound:
         return False, f"Member {discord_id} not found in guild {guild.id}"
     except Exception as e:
         return False, f"Error fetching member {discord_id}: {e}"
-
-    role_id = PLAN_TO_ROLE.get(plan)
-    if not role_id:
-        return False, f"No role mapping for plan '{plan}'"
-
-    role = guild.get_role(int(role_id))
+    role_id = PLAN_TO_ROLE[plan]
+    role = guild.get_role(role_id)
     if not role:
-        return False, f"Role object for id {role_id} not found in guild"
-
+        return False, f"Role {role_id} not found in guild"
     try:
         if action == "assign":
-            # If already has role, success
             if role in member.roles:
+                print(f"[Discord] Member {discord_id} already has role {plan}")
                 return True, None
             await member.add_roles(role, reason="Subscription activation")
-            # Confirm
-            member = await guild.fetch_member(int(discord_id))
-            if role in member.roles:
-                return True, None
-            else:
-                return False, "Role assignment didn't persist (post-check failed)"
+            print(f"[Discord] Assigned role {plan} to {discord_id}")
+            return True, None
         elif action == "remove":
             if role not in member.roles:
+                print(f"[Discord] Member {discord_id} does not have role {plan}")
                 return True, None
             await member.remove_roles(role, reason="Subscription canceled")
-            member = await guild.fetch_member(int(discord_id))
-            if role not in member.roles:
-                return True, None
-            else:
-                return False, "Role removal didn't persist (post-check failed)"
+            print(f"[Discord] Removed role {plan} from {discord_id}")
+            return True, None
         else:
             return False, f"Unknown action '{action}'"
     except discord.Forbidden:
-        return False, "Discord Forbidden: missing Manage Roles permission or role hierarchy issue"
+        return False, "Missing Manage Roles permission or role hierarchy issue"
     except discord.HTTPException as e:
         return False, f"Discord HTTPException: {e}"
     except Exception as e:
         return False, f"Unexpected exception: {e}"
 
-# Exponential backoff wrapper for a single DB assignment row
-async def process_assignment_row(row):
-    """
-    row: (id, discord_id, plan, action, email, stripe_subscription_id, attempts)
-    """
-    row_id, discord_id, plan, action, email, stripe_subscription_id, attempts = row
-    attempts = attempts or 0
-
+async def process_assignment_row(assignment):
+    row_id = assignment['row_id']
+    discord_id = assignment['discord_id']
+    plan = assignment['plan']
+    action = assignment['action']
+    attempts = assignment.get('attempts', 0)
     backoff = INITIAL_BACKOFF * (BACKOFF_MULTIPLIER ** attempts)
     if attempts > 0:
-        print(f"[Retry] id={row_id} discord_id={discord_id} plan={plan} action={action} attempts={attempts} waiting {backoff}s before retry")
+        print(f"[Retry] row_id={row_id} discord_id={discord_id} plan={plan} action={action} attempts={attempts} waiting {backoff}s")
         await asyncio.sleep(backoff)
-
     success, err = await assign_or_remove_role(discord_id, plan, action)
     if success:
-        print(f"[Success] id={row_id} discord_id={discord_id} plan={plan} action={action}")
-        remove_assignment(row_id)
+        print(f"[Success] row_id={row_id} discord_id={discord_id} plan={plan} action={action}")
+        remove_assignment_from_sheet(row_id)
     else:
         error_text = f"{datetime.utcnow().isoformat()} | {err}"
-        print(f"[Fail] id={row_id} discord_id={discord_id} plan={plan} action={action} attempt={attempts + 1} error={err}")
-        increment_attempts_and_log_error(row_id, error_text)
-        # If we've reached max attempts, keep it in DB but print an alert and optionally notify admins
+        print(f"[Fail] row_id={row_id} discord_id={discord_id} plan={plan} action={action} attempt={attempts + 1} error={err}")
+        increment_attempts_and_log_error_in_sheet(row_id, error_text)
         if attempts + 1 >= MAX_ATTEMPTS:
-            print(f"[Alert] id={row_id} reached max attempts ({MAX_ATTEMPTS}). Manual intervention may be required. last_error={err}")
+            print(f"[Alert] row_id={row_id} reached max attempts ({MAX_ATTEMPTS}). Edit Sheet1 (row {row_id}) to set attempts=0 or status='pending' for retry.")
 
-# Loop that processes queue periodically
 async def queue_processor_loop():
     await bot.wait_until_ready()
     print("[Worker] Starting queue processor loop")
     while True:
         try:
-            rows = get_pending_assignments(limit=50)
-            if not rows:
-                # nothing pending; sleep a bit
-                await asyncio.sleep(5)
+            assignments = get_pending_assignments_from_sheet(limit=50)
+            if not assignments:
+                await asyncio.sleep(30)
                 continue
-
-            # process tasks concurrently but bounded
-            tasks = []
-            for row in rows:
-                # Each row processed independently
-                tasks.append(asyncio.create_task(process_assignment_row(row)))
-
-            # Wait for all tasks from this batch to finish
+            tasks = [asyncio.create_task(process_assignment_row(assignment)) for assignment in assignments]
             if tasks:
                 await asyncio.gather(*tasks)
-            # Short pause before next loop
             await asyncio.sleep(1)
         except Exception as e:
             print(f"[Worker] Unexpected error in queue loop: {e}")
             await asyncio.sleep(5)
 
-# Utility to schedule a queue processing tick from other threads (like Flask)
-def schedule_immediate_processing():
-    try:
-        bot.loop.call_soon_threadsafe(lambda: bot.loop.create_task(_wake_queue_once()))
-    except Exception as e:
-        print(f"[Scheduler] Failed to schedule immediate processing: {e}")
-
-# Helper coroutine that triggers one immediate pass (used to make the queue worker check right away)
-async def _wake_queue_once():
-    rows = get_pending_assignments(limit=50)
-    if not rows:
-        return
-    tasks = [asyncio.create_task(process_assignment_row(row)) for row in rows]
-    if tasks:
-        await asyncio.gather(*tasks)
+def run_bot():
+    print("[Startup] Running in BOT mode (Background Worker)")
+    bot.run(DISCORD_BOT_TOKEN)
 
 # ------------------------------
-# Flask app (OAuth + Webhooks)
+# Flask App (Web Service)
 # ------------------------------
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "supersecretkey")
-
-# Stripe setup (used only to verify webhook signature)
-import stripe
+app.secret_key = FLASK_SECRET_KEY
+limiter = Limiter(app, key_func=get_remote_address)
 stripe.api_key = STRIPE_SECRET_KEY
-
 SCOPE = "identify email"
 
 @app.route("/")
@@ -287,67 +242,79 @@ def index():
     return "OK"
 
 @app.route("/login")
+@limiter.limit("10 per minute")
 def login():
     plan = request.args.get("plan")
-    if plan:
-        session["plan"] = plan
+    if not plan or plan not in PLAN_TO_ROLE:
+        print(f"[OAuth] Invalid or missing plan: {plan}")
+        return "Invalid plan", 400
+    session["plan"] = plan
     params = {
         "client_id": DISCORD_CLIENT_ID,
         "redirect_uri": DISCORD_REDIRECT_URI,
         "response_type": "code",
         "scope": SCOPE,
     }
+    print(f"[OAuth] Initiating OAuth for plan={plan}")
     return redirect(f"https://discord.com/api/oauth2/authorize?{urlencode(params)}")
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def update_subscription_sheet(email, discord_id, plan, status, stripe_customer_id=None, stripe_subscription_id=None):
     payload = {
-        "email": email,
-        "discord_id": discord_id,
-        "plan": plan,
-        "status": status,
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "stripe_customer_id": stripe_customer_id,
-        "stripe_subscription_id": stripe_subscription_id
+        "action": "update_subscription",
+        "data": {
+            "email": email,
+            "discord_id": discord_id,
+            "plan": plan,
+            "status": status,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "stripe_customer_id": stripe_customer_id,
+            "stripe_subscription_id": stripe_subscription_id
+        }
     }
-    try:
-        r = requests.post(GOOGLE_APPS_SCRIPT_URL, json=payload, timeout=8)
-        r.raise_for_status()
-        print(f"[Sheet] Updated sheet: email={email} plan={plan} status={status}")
-        return True
-    except Exception as e:
-        print(f"[Sheet] Failed to update sheet: {e}")
-        return False
+    r = requests.post(GOOGLE_APPS_SCRIPT_URL, json=payload, timeout=8)
+    r.raise_for_status()
+    print(f"[Sheets] Updated subscription: email={email} discord_id={discord_id} plan={plan} status={status}")
+    return True
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def lookup_by_subscription_id(subscription_id):
-    try:
-        r = requests.get(GOOGLE_APPS_SCRIPT_URL, params={"stripe_subscription_id": subscription_id}, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("email"), data.get("discord_id"), data.get("plan")
-    except Exception as e:
-        print(f"[Sheet] lookup_by_subscription_id failed: {e}")
+    r = requests.get(GOOGLE_APPS_SCRIPT_URL, params={"action": "lookup_by_subscription_id", "subscription_id": subscription_id}, timeout=8)
+    r.raise_for_status()
+    data = r.json()
+    email = data.get("email")
+    discord_id = data.get("discord_id")
+    plan = data.get("plan")
+    if not all([email, discord_id, plan]):
+        print(f"[Sheets] Incomplete lookup result for subscription_id={subscription_id}: {data}")
         return None, None, None
+    print(f"[Sheets] Lookup success: subscription_id={subscription_id} email={email} discord_id={discord_id} plan={plan}")
+    return email, discord_id, plan
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def lookup_by_email(email):
-    try:
-        r = requests.get(GOOGLE_APPS_SCRIPT_URL, params={"email": email}, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("discord_id")
-    except Exception as e:
-        print(f"[Sheet] lookup_by_email failed: {e}")
-        return None
+    r = requests.get(GOOGLE_APPS_SCRIPT_URL, params={"action": "lookup_by_email", "email": email}, timeout=8)
+    r.raise_for_status()
+    data = r.json()
+    discord_id = data.get("discord_id")
+    plan = data.get("plan")
+    if not discord_id or not plan:
+        print(f"[Sheets] Incomplete lookup for email={email}: discord_id={discord_id}, plan={plan}")
+        return None, None
+    print(f"[Sheets] Lookup success: email={email} discord_id={discord_id} plan={plan}")
+    return discord_id, plan
 
 @app.route("/callback")
+@limiter.limit("10 per minute")
 def callback():
-    """
-    OAuth callback: exchange code, get user info, update sheet, queue assignment immediately.
-    """
     code = request.args.get("code")
-    plan = session.get("plan") or request.args.get("plan") or "Unknown"
+    plan = session.get("plan")
     if not code:
+        print("[OAuth] Missing code in callback")
         return "Missing code", 400
-
+    if not plan or plan not in PLAN_TO_ROLE:
+        print(f"[OAuth] Invalid or missing plan in callback: {plan}")
+        return "Invalid plan", 400
     token_data = {
         "client_id": DISCORD_CLIENT_ID,
         "client_secret": DISCORD_CLIENT_SECRET,
@@ -360,10 +327,12 @@ def callback():
         r = requests.post("https://discord.com/api/oauth2/token", data=token_data, headers=headers, timeout=8)
         r.raise_for_status()
         creds = r.json()
+        if creds.get("scope") != SCOPE:
+            print(f"[OAuth] Invalid scope: expected {SCOPE}, got {creds.get('scope')}")
+            return "Invalid OAuth scope", 400
     except Exception as e:
         print(f"[OAuth] Token exchange failed: {e}")
         return "OAuth token exchange failed", 500
-
     try:
         user_resp = requests.get("https://discord.com/api/users/@me", headers={"Authorization": f"Bearer {creds['access_token']}"}, timeout=8)
         user_resp.raise_for_status()
@@ -373,26 +342,17 @@ def callback():
     except Exception as e:
         print(f"[OAuth] Failed to fetch user info: {e}")
         return "Failed to fetch user info", 500
-
     print(f"[OAuth] Success: discord_id={discord_id} email={email} plan={plan}")
-
-    # Update Google Sheet with linked/active status
-    sheet_ok = update_subscription_sheet(email, discord_id, plan, "active")
-
-    # Immediately queue assignment task (persisted)
-    row_id = add_assignment_to_db(discord_id, plan, "assign", email=email)
-
-    # Schedule the queue worker to process immediately
-    schedule_immediate_processing()
-
+    try:
+        update_subscription_sheet(email, discord_id, plan, "linked")
+    except Exception as e:
+        print(f"[OAuth] Failed to update sheet: {e}")
+        return "Failed to update Google Sheet", 500
     return redirect("https://marketwavetrading.com/success")
 
 @app.route("/webhook", methods=["POST"])
+@limiter.limit("100 per minute")
 def stripe_webhook():
-    """
-    Handle Stripe webhook events for subscription creations and deletions.
-    Adds to queue and updates Google Sheet.
-    """
     payload = request.data
     sig_header = request.headers.get("Stripe-Signature")
     try:
@@ -400,62 +360,69 @@ def stripe_webhook():
     except Exception as e:
         print(f"[Stripe] Webhook signature verification failed: {e}")
         return "Invalid signature", 400
-
     ev_type = event["type"]
     print(f"[Stripe] Received event: {ev_type}")
-
     if ev_type == "checkout.session.completed":
         session_obj = event["data"]["object"]
         email = session_obj.get("customer_details", {}).get("email", "")
         stripe_customer_id = session_obj.get("customer")
-        plan = session_obj.get("metadata", {}).get("plan", "Unknown")
+        plan = session_obj.get("metadata", {}).get("plan", None)
         stripe_subscription_id = session_obj.get("subscription")
-
-        # Try to get discord_id from sheet first, fallback to metadata
-        discord_id = lookup_by_email(email) or session_obj.get("metadata", {}).get("discord_id")
-
-        update_subscription_sheet(email, discord_id, plan, "active", stripe_customer_id, stripe_subscription_id)
-
-        if discord_id and plan:
-            add_assignment_to_db(discord_id, plan, "assign", email=email, stripe_subscription_id=stripe_subscription_id)
-            schedule_immediate_processing()
-        else:
-            print(f"[Stripe] Missing discord_id or plan for checkout.session.completed: email={email} metadata={session_obj.get('metadata')}")
-
-        return jsonify({"status":"success"}), 200
-
-    if ev_type == "customer.subscription.deleted":
+        if not email or not plan or plan not in PLAN_TO_ROLE:
+            print(f"[Stripe] Invalid data in checkout.session.completed: email={email} plan={plan}")
+            return jsonify({"status": "error", "message": "Invalid email or plan"}), 400
+        discord_id, existing_plan = lookup_by_email(email)
+        if not discord_id or existing_plan != plan:
+            print(f"[Stripe] Invalid lookup for email={email}: discord_id={discord_id}, existing_plan={existing_plan}, expected_plan={plan}")
+            return jsonify({"status": "error", "message": "No Discord ID or plan mismatch"}), 400
+        try:
+            update_subscription_sheet(email, discord_id, plan, "active", stripe_customer_id, stripe_subscription_id)
+        except Exception as e:
+            print(f"[Stripe] Failed to update sheet for email={email}: {e}")
+            return jsonify({"status": "error", "message": "Failed to update sheet"}), 500
+        add_assignment_to_sheet(discord_id, plan, "assign", email, stripe_subscription_id)
+        return jsonify({"status": "success"}), 200
+    elif ev_type == "customer.subscription.deleted":
         subscription = event["data"]["object"]
         stripe_subscription_id = subscription.get("id")
         stripe_customer_id = subscription.get("customer")
         email, discord_id, plan = lookup_by_subscription_id(stripe_subscription_id)
+        if not all([email, discord_id, plan]) or plan not in PLAN_TO_ROLE:
+            print(f"[Stripe] Invalid lookup for subscription_id={stripe_subscription_id}: email={email} discord_id={discord_id} plan={plan}")
+            return jsonify({"status": "error", "message": "Invalid subscription data"}), 400
+        try:
+            update_subscription_sheet(email, discord_id, plan, "canceled", stripe_customer_id, stripe_subscription_id)
+        except Exception as e:
+            print(f"[Stripe] Failed to update sheet for subscription_id={stripe_subscription_id}: {e}")
+            return jsonify({"status": "error", "message": "Failed to update sheet"}), 500
+        add_assignment_to_sheet(discord_id, plan, "remove", email, stripe_subscription_id)
+        return jsonify({"status": "success"}), 200
+    elif ev_type == "invoice.payment_failed":
+        invoice = event["data"]["object"]
+        stripe_subscription_id = invoice.get("subscription")
+        if stripe_subscription_id:
+            email, discord_id, plan = lookup_by_subscription_id(stripe_subscription_id)
+            if all([email, discord_id, plan]):
+                print(f"[Stripe] Payment failed for subscription {stripe_subscription_id}; queuing removal")
+                add_assignment_to_sheet(discord_id, plan, "remove", email, stripe_subscription_id)
+        return jsonify({"status": "handled"}), 200
+    print(f"[Stripe] Ignored event: {ev_type}")
+    return jsonify({"status": "ignored"}), 200
 
-        update_subscription_sheet(email, discord_id, plan, "canceled", stripe_customer_id, stripe_subscription_id)
-
-        if discord_id and plan:
-            add_assignment_to_db(discord_id, plan, "remove", email=email, stripe_subscription_id=stripe_subscription_id)
-            schedule_immediate_processing()
-        else:
-            print(f"[Stripe] cancellation webhook missing data: subscription={stripe_subscription_id} lookup result email={email} discord_id={discord_id} plan={plan}")
-
-        return jsonify({"status":"success"}), 200
-
-    # You can add more event types to handle (invoice.payment_failed etc.)
-    return jsonify({"status":"ignored"}), 200
-
-# ------------------------------
-# Startup wiring
-# ------------------------------
 def run_flask():
-    # Use host 0.0.0.0 and port from env or default 5000
     port = int(os.environ.get("PORT", 5000))
+    print(f"[Startup] Running in WEB mode (Web Service) on port {port}")
     app.run(host="0.0.0.0", port=port)
 
+# ------------------------------
+# Startup Wiring
+# ------------------------------
 if __name__ == "__main__":
-    # Initialize DB
-    init_db()
-    # Start flask in a thread (so bot runs in main thread as required by discord.py)
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    # Run discord bot (this call blocks until bot exits)
-    bot.run(DISCORD_BOT_TOKEN)
+    validate_env_vars()
+    mode = sys.argv[1] if len(sys.argv) > 1 else os.getenv("MODE", "web")
+    if mode == "web":
+        run_flask()
+    elif mode == "bot":
+        run_bot()
+    else:
+        raise ValueError(f"[Startup] Invalid MODE: {mode}. Use 'web' or 'bot'.")

@@ -1,5 +1,9 @@
-Flask
-requests
-stripe
-discord.py
-python-dotenv
+# requirements.txt
+flask==2.3.3
+discord.py==2.3.2
+stripe==7.0.0
+python-dotenv==1.0.0
+flask-limiter==3.5.0
+tenacity==8.2.3
+requests==2.31.0
+gunicorn==21.2.0
