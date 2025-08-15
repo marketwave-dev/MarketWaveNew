@@ -246,8 +246,12 @@ async def _wake_queue_once():
 # Flask App
 # ------------------------------
 app = Flask(__name__)
-app.secret_key = FLASK_SECRET_KEY
-limiter = Limiter(get_remote_address, app=app)
+app.secret_key = os.getenv("FLASK_SECRET_KEY") or os.urandom(24).hex()
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    storage_uri="memory:////opt/render/project/src/rate_limit.db"
+)
 stripe.api_key = STRIPE_SECRET_KEY
 SCOPE = "identify email"
 
