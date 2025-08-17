@@ -140,7 +140,7 @@ def remove_assignment_from_sheet(row_id):
 
 # ------------------------------
 # Discord Bot Setup
-# ------------------------------
+# ----------------------
 intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -248,7 +248,7 @@ async def _wake_queue_once():
 
 # ------------------------------
 # Flask App
-# ------------------------------
+# ----------------------
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY") or os.urandom(24).hex()
 limiter = Limiter(
@@ -281,7 +281,7 @@ def login():
     return redirect(f"https://discord.com/api/oauth2/authorize?{urlencode(params)}")
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def update_subscription_sheet(email, discord_id, plan, status, stripe_customer_id=None, stripe_subscription_id=None):
+def update_subscription_sheet(email, discord_id, plan, status, stripe_customer_id=None, stripe_subscription_id=None, coupon_id=None):
     payload = {
         "action": "update_subscription",
         "data": {
@@ -291,12 +291,13 @@ def update_subscription_sheet(email, discord_id, plan, status, stripe_customer_i
             "status": status,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "stripe_customer_id": stripe_customer_id,
-            "stripe_subscription_id": stripe_subscription_id
+            "stripe_subscription_id": stripe_subscription_id,
+            "coupon_id": coupon_id
         }
     }
     r = requests.post(GOOGLE_APPS_SCRIPT_URL, json=payload, timeout=8)
     r.raise_for_status()
-    print(f"[Sheets] Updated subscription: email={email} discord_id={discord_id} plan={plan} status={status}")
+    print(f"[Sheets] Updated subscription: email={email} discord_id={discord_id} plan={plan} status={status} coupon_id={coupon_id}")
     return True
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
@@ -382,6 +383,7 @@ def callback():
             cancel_url="https://marketwavetrading.com/cancel",
             metadata={"plan": plan, "discord_id": discord_id},
             customer_email=email,
+            allow_promotion_codes=True  # Enable promotion code input
         )
         print(f"[Stripe] Created checkout session for discord_id={discord_id} plan={plan}")
         return redirect(checkout_session.url)
@@ -408,11 +410,21 @@ def stripe_webhook():
         plan = session_obj.get("metadata", {}).get("plan", None)
         discord_id = session_obj.get("metadata", {}).get("discord_id")
         stripe_subscription_id = session_obj.get("subscription")
+        # Extract coupon or promotion code
+        coupon_id = None
+        discounts = session_obj.get("discounts", [])
+        if discounts:
+            discount_id = discounts[0]  # Checkout supports one discount
+            try:
+                discount = stripe.Discount.retrieve(discount_id)
+                coupon_id = discount.get("coupon", {}).get("id") or discount.get("promotion_code")
+            except Exception as e:
+                print(f"[Stripe] Failed to retrieve discount details: {e}")
         if not email or not plan or plan not in PLAN_TO_ROLE or not discord_id:
             print(f"[Stripe] Invalid data in checkout.session.completed: email={email} plan={plan} discord_id={discord_id}")
             return jsonify({"status": "error", "message": "Invalid email, plan, or discord_id"}), 400
         try:
-            update_subscription_sheet(email, discord_id, plan, "active", stripe_customer_id, stripe_subscription_id)
+            update_subscription_sheet(email, discord_id, plan, "active", stripe_customer_id, stripe_subscription_id, coupon_id)
         except Exception as e:
             print(f"[Stripe] Failed to update sheet for email={email}: {e}")
             return jsonify({"status": "error", "message": "Failed to update sheet"}), 500
@@ -453,7 +465,7 @@ def stripe_webhook():
 
 # ------------------------------
 # Startup Wiring
-# ------------------------------
+# ----------------------
 def run_flask():
     port = int(os.environ.get("PORT", 5000))
     print(f"[Startup] Starting Flask server on port {port}")
