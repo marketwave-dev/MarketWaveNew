@@ -78,12 +78,16 @@ def add_assignment_to_sheet(discord_id, plan, action, email=None, stripe_subscri
         return None
     pending = get_pending_assignments_from_sheet(limit=100)
     for assignment in pending:
-        if (assignment['discord_id'] == str(discord_id) and
-            assignment['plan'] == plan and
-            assignment['action'] == action and
-            assignment['attempts'] < MAX_ATTEMPTS):
-            print(f"[Sheets] Skipped duplicate assignment for discord_id={discord_id} plan={plan} action={action}")
-            return None
+        try:
+            if (assignment.get('discord_id') == str(discord_id) and
+                assignment.get('plan') == plan and
+                assignment.get('action') == action and
+                assignment.get('attempts', 0) < MAX_ATTEMPTS):
+                print(f"[Sheets] Skipped duplicate assignment for discord_id={discord_id} plan={plan} action={action}")
+                return None
+        except KeyError as e:
+            print(f"[Sheets] Skipping assignment due to missing key: {e}")
+            continue
     payload = {
         "action": "insert_assignment",
         "data": {
@@ -140,7 +144,7 @@ def remove_assignment_from_sheet(row_id):
 
 # ------------------------------
 # Discord Bot Setup
-# ----------------------
+# ------------------------------
 intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -194,7 +198,7 @@ async def process_assignment_row(assignment):
     row_id = assignment['row_id']
     discord_id = assignment['discord_id']
     plan = assignment['plan']
-    action = assignment['action']
+    action = assignment.get('action', 'unknown')
     attempts = assignment.get('attempts', 0)
     backoff = INITIAL_BACKOFF * (BACKOFF_MULTIPLIER ** attempts)
     if attempts > 0:
@@ -231,7 +235,7 @@ async def queue_processor_loop():
 def schedule_immediate_processing():
     try:
         if bot.is_ready():
-            bot.loop.call_soon_threadsafe(lambda: bot.loop.create_task(_wake_queue_once()))
+            asyncio.run_coroutine_threadsafe(_wake_queue_once(), bot.loop)
         else:
             print("[Scheduler] Bot not ready, deferring immediate processing")
             bot.loop.create_task(_wake_queue_once())
@@ -248,7 +252,7 @@ async def _wake_queue_once():
 
 # ------------------------------
 # Flask App
-# ----------------------
+# ------------------------------
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY") or os.urandom(24).hex()
 limiter = Limiter(
@@ -368,7 +372,6 @@ def callback():
         print(f"[OAuth] Failed to fetch user info: {e}")
         return "Failed to fetch user info", 500
     print(f"[OAuth] Success: discord_id={discord_id} email={email} plan={plan}")
-    # Create Stripe checkout session
     try:
         checkout_session = stripe.checkout.Session.create(
             payment_method_types=["card"],
@@ -383,7 +386,7 @@ def callback():
             cancel_url="https://marketwavetrading.com/cancel",
             metadata={"plan": plan, "discord_id": discord_id},
             customer_email=email,
-            allow_promotion_codes=True  # Enable promotion code input
+            allow_promotion_codes=True
         )
         print(f"[Stripe] Created checkout session for discord_id={discord_id} plan={plan}")
         return redirect(checkout_session.url)
@@ -410,16 +413,14 @@ def stripe_webhook():
         plan = session_obj.get("metadata", {}).get("plan", None)
         discord_id = session_obj.get("metadata", {}).get("discord_id")
         stripe_subscription_id = session_obj.get("subscription")
-        # Extract coupon or promotion code
         coupon_id = None
-        discounts = session_obj.get("discounts", [])
-        if discounts:
-            discount_id = discounts[0]  # Checkout supports one discount
+        if session_obj.get("total_details", {}).get("amount_discount", 0) > 0:
             try:
-                discount = stripe.Discount.retrieve(discount_id)
-                coupon_id = discount.get("coupon", {}).get("id") or discount.get("promotion_code")
+                subscription = stripe.Subscription.retrieve(stripe_subscription_id)
+                coupon_id = subscription.get("discount", {}).get("coupon", {}).get("id") or subscription.get("discount", {}).get("promotion_code")
+                print(f"[Stripe] Coupon applied: coupon_id={coupon_id}")
             except Exception as e:
-                print(f"[Stripe] Failed to retrieve discount details: {e}")
+                print(f"[Stripe] Failed to retrieve coupon details: {e}")
         if not email or not plan or plan not in PLAN_TO_ROLE or not discord_id:
             print(f"[Stripe] Invalid data in checkout.session.completed: email={email} plan={plan} discord_id={discord_id}")
             return jsonify({"status": "error", "message": "Invalid email, plan, or discord_id"}), 400
@@ -465,7 +466,7 @@ def stripe_webhook():
 
 # ------------------------------
 # Startup Wiring
-# ----------------------
+# ------------------------------
 def run_flask():
     port = int(os.environ.get("PORT", 5000))
     print(f"[Startup] Starting Flask server on port {port}")
