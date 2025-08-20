@@ -241,7 +241,6 @@ def schedule_immediate_processing():
             asyncio.run_coroutine_threadsafe(_wake_queue_once(), bot.loop)
         else:
             print("[Scheduler] Bot not ready, scheduling deferred processing")
-            # Schedule task to run after bot is ready
             async def deferred_processing():
                 await bot.wait_until_ready()
                 print("[Scheduler] Bot ready, executing deferred processing")
@@ -451,8 +450,7 @@ def stripe_webhook():
         stripe_customer_id = subscription.get("customer")
         email, discord_id, plan = lookup_by_subscription_id(stripe_subscription_id)
         if not all([email, discord_id, plan]) or plan not in PLAN_TO_ROLE:
-            print(f"[Stripe] Invalid lookup for subscription_id={stripe_subscription_id}: email={email} discord_id={disk
-cord_id} plan={plan}")
+            print(f"[Stripe] Invalid lookup for subscription_id={stripe_subscription_id}: email={email} discord_id={discord_id} plan={plan}")
             return jsonify({"status": "error", "message": "Invalid subscription data"}), 400
         try:
             update_subscription_sheet(email, discord_id, plan, "canceled", stripe_customer_id, stripe_subscription_id)
