@@ -144,7 +144,7 @@ def remove_assignment_from_sheet(row_id):
 
 # ------------------------------
 # Discord Bot Setup
-# ------------------------------
+# ----------------------
 intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -222,8 +222,10 @@ async def queue_processor_loop():
         try:
             assignments = get_pending_assignments_from_sheet(limit=50)
             if not assignments:
+                print("[Worker] No pending assignments, sleeping for 30s")
                 await asyncio.sleep(30)
                 continue
+            print(f"[Worker] Processing {len(assignments)} pending assignments")
             tasks = [asyncio.create_task(process_assignment_row(assignment)) for assignment in assignments]
             if tasks:
                 await asyncio.gather(*tasks)
@@ -235,24 +237,34 @@ async def queue_processor_loop():
 def schedule_immediate_processing():
     try:
         if bot.is_ready():
+            print("[Scheduler] Bot ready, scheduling immediate processing")
             asyncio.run_coroutine_threadsafe(_wake_queue_once(), bot.loop)
         else:
-            print("[Scheduler] Bot not ready, deferring immediate processing")
-            bot.loop.create_task(_wake_queue_once())
+            print("[Scheduler] Bot not ready, scheduling deferred processing")
+            # Schedule task to run after bot is ready
+            async def deferred_processing():
+                await bot.wait_until_ready()
+                print("[Scheduler] Bot ready, executing deferred processing")
+                await _wake_queue_once()
+            asyncio.run_coroutine_threadsafe(deferred_processing(), asyncio.get_event_loop())
     except Exception as e:
         print(f"[Scheduler] Failed to schedule immediate processing: {e}")
 
 async def _wake_queue_once():
-    assignments = get_pending_assignments_from_sheet(limit=50)
-    if not assignments:
-        print("[Scheduler] No pending assignments to process")
-        return
-    tasks = [asyncio.create_task(process_assignment_row(assignment)) for assignment in assignments]
-    await asyncio.gather(*tasks)
+    try:
+        assignments = get_pending_assignments_from_sheet(limit=50)
+        if not assignments:
+            print("[Scheduler] No pending assignments to process")
+            return
+        print(f"[Scheduler] Processing {len(assignments)} pending assignments")
+        tasks = [asyncio.create_task(process_assignment_row(assignment)) for assignment in assignments]
+        await asyncio.gather(*tasks)
+    except Exception as e:
+        print(f"[Scheduler] Error in _wake_queue_once: {e}")
 
 # ------------------------------
 # Flask App
-# ------------------------------
+# ----------------------
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY") or os.urandom(24).hex()
 limiter = Limiter(
@@ -439,7 +451,8 @@ def stripe_webhook():
         stripe_customer_id = subscription.get("customer")
         email, discord_id, plan = lookup_by_subscription_id(stripe_subscription_id)
         if not all([email, discord_id, plan]) or plan not in PLAN_TO_ROLE:
-            print(f"[Stripe] Invalid lookup for subscription_id={stripe_subscription_id}: email={email} discord_id={discord_id} plan={plan}")
+            print(f"[Stripe] Invalid lookup for subscription_id={stripe_subscription_id}: email={email} discord_id={disk
+cord_id} plan={plan}")
             return jsonify({"status": "error", "message": "Invalid subscription data"}), 400
         try:
             update_subscription_sheet(email, discord_id, plan, "canceled", stripe_customer_id, stripe_subscription_id)
@@ -466,7 +479,7 @@ def stripe_webhook():
 
 # ------------------------------
 # Startup Wiring
-# ------------------------------
+# ----------------------
 def run_flask():
     port = int(os.environ.get("PORT", 5000))
     print(f"[Startup] Starting Flask server on port {port}")
@@ -474,6 +487,12 @@ def run_flask():
 
 if __name__ == "__main__":
     validate_env_vars()
+    # Start Discord bot first to ensure loop is initialized
+    bot_thread = threading.Thread(target=lambda: bot.run(DISCORD_BOT_TOKEN), daemon=True)
+    bot_thread.start()
+    # Wait briefly to allow bot initialization
+    time.sleep(5)
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    bot.run(DISCORD_BOT_TOKEN)
+    # Keep main thread alive
+    bot_thread.join()
