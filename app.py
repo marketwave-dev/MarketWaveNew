@@ -152,6 +152,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     print(f"[Discord] Bot logged in as {bot.user} (id={bot.user.id})")
+    print(f"[Discord] Event loop initialized: {bot.loop}")
     bot.loop.create_task(queue_processor_loop())
 
 async def assign_or_remove_role(discord_id: str, plan: str, action: str):
@@ -225,7 +226,7 @@ async def queue_processor_loop():
                 print("[Worker] No pending assignments, sleeping for 30s")
                 await asyncio.sleep(30)
                 continue
-            print(f"[Worker] Processing {len(assignments)} pending assignments")
+            print(f"[Worker] Processing {len(assignments)} pending assignments: {[a['row_id'] for a in assignments]}")
             tasks = [asyncio.create_task(process_assignment_row(assignment)) for assignment in assignments]
             if tasks:
                 await asyncio.gather(*tasks)
@@ -245,7 +246,7 @@ def schedule_immediate_processing():
                 await bot.wait_until_ready()
                 print("[Scheduler] Bot ready, executing deferred processing")
                 await _wake_queue_once()
-            asyncio.run_coroutine_threadsafe(deferred_processing(), asyncio.get_event_loop())
+            asyncio.run_coroutine_threadsafe(deferred_processing(), bot.loop)  # Use bot.loop instead of asyncio.get_event_loop()
     except Exception as e:
         print(f"[Scheduler] Failed to schedule immediate processing: {e}")
 
@@ -255,7 +256,7 @@ async def _wake_queue_once():
         if not assignments:
             print("[Scheduler] No pending assignments to process")
             return
-        print(f"[Scheduler] Processing {len(assignments)} pending assignments")
+        print(f"[Scheduler] Processing {len(assignments)} pending assignments: {[a['row_id'] for a in assignments]}")
         tasks = [asyncio.create_task(process_assignment_row(assignment)) for assignment in assignments]
         await asyncio.gather(*tasks)
     except Exception as e:
@@ -479,7 +480,7 @@ def stripe_webhook():
 # Startup Wiring
 # ----------------------
 def run_flask():
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))
     print(f"[Startup] Starting Flask server on port {port}")
     app.run(host="0.0.0.0", port=port)
 
@@ -488,8 +489,8 @@ if __name__ == "__main__":
     # Start Discord bot first to ensure loop is initialized
     bot_thread = threading.Thread(target=lambda: bot.run(DISCORD_BOT_TOKEN), daemon=True)
     bot_thread.start()
-    # Wait briefly to allow bot initialization
-    time.sleep(5)
+    # Wait longer to ensure bot initialization
+    time.sleep(10)
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     # Keep main thread alive
