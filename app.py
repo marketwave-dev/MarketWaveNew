@@ -155,6 +155,15 @@ async def on_ready():
     print(f"[Discord] Event loop initialized: {bot.loop}")
     bot.loop.create_task(queue_processor_loop())
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=5, max=30))
+def start_discord_bot():
+    print("[Discord] Attempting to start bot")
+    try:
+        bot.run(DISCORD_BOT_TOKEN)
+    except Exception as e:
+        print(f"[Discord] Failed to start bot: {e}")
+        raise
+
 async def assign_or_remove_role(discord_id: str, plan: str, action: str):
     if plan not in PLAN_TO_ROLE:
         return False, f"No role mapping for plan '{plan}'"
@@ -246,7 +255,7 @@ def schedule_immediate_processing():
                 await bot.wait_until_ready()
                 print("[Scheduler] Bot ready, executing deferred processing")
                 await _wake_queue_once()
-            asyncio.run_coroutine_threadsafe(deferred_processing(), bot.loop)  # Use bot.loop instead of asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(deferred_processing(), bot.loop)
     except Exception as e:
         print(f"[Scheduler] Failed to schedule immediate processing: {e}")
 
@@ -476,6 +485,20 @@ def stripe_webhook():
     print(f"[Stripe] Ignored event: {ev_type}")
     return jsonify({"status": "ignored"}), 200
 
+@app.route("/trigger_assignments", methods=["GET"])
+@limiter.limit("5 per minute")
+def trigger_assignments():
+    print("[Manual] Triggering manual assignment processing")
+    try:
+        if bot.is_ready():
+            asyncio.run_coroutine_threadsafe(_wake_queue_once(), bot.loop)
+            return jsonify({"status": "success", "message": "Triggered assignment processing"}), 200
+        else:
+            return jsonify({"status": "error", "message": "Bot not ready, try again later"}), 503
+    except Exception as e:
+        print(f"[Manual] Failed to trigger assignments: {e}")
+        return jsonify({"status": "error", "message": f"Failed to trigger: {str(e)}"}), 500
+
 # ------------------------------
 # Startup Wiring
 # ----------------------
@@ -486,11 +509,13 @@ def run_flask():
 
 if __name__ == "__main__":
     validate_env_vars()
-    # Start Discord bot first to ensure loop is initialized
-    bot_thread = threading.Thread(target=lambda: bot.run(DISCORD_BOT_TOKEN), daemon=True)
+    # Start Discord bot with retries
+    bot_thread = threading.Thread(target=start_discord_bot, daemon=True)
+    print("[Startup] Starting Discord bot thread")
     bot_thread.start()
     # Wait longer to ensure bot initialization
-    time.sleep(10)
+    time.sleep(15)
+    print("[Startup] Starting Flask thread")
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     # Keep main thread alive
