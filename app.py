@@ -68,6 +68,10 @@ PLAN_TO_PRICE_ID = {
     "MarketWave Plus": "price_1RdEoc08Ntv6wEBmifMeruFq"
 }
 
+# Global fallback event loop
+fallback_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(fallback_loop)
+
 # ------------------------------
 # Google Sheets Queue Functions
 # ------------------------------
@@ -99,8 +103,8 @@ def add_assignment_to_sheet(discord_id, plan, action, email=None, stripe_subscri
             "stripe_subscription_id": stripe_subscription_id,
             "attempts": 0,
             "last_error": None,
-            "created_at": datetime.now().isoformat(),
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "created_at": datetime.utcnow().isoformat(),
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         }
     }
     r = requests.post(GOOGLE_APPS_SCRIPT_URL, json=payload, timeout=8)
@@ -155,14 +159,31 @@ async def on_ready():
     print(f"[Discord] Event loop initialized: {bot.loop}")
     bot.loop.create_task(queue_processor_loop())
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=5, max=30))
 def start_discord_bot():
-    print("[Discord] Attempting to start bot")
+    print("[Discord] Preparing to start bot")
     try:
-        bot.run(DISCORD_BOT_TOKEN)
+        # Ensure bot has an event loop
+        if not hasattr(bot, 'loop'):
+            print("[Discord] Creating new event loop for bot")
+            bot.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(bot.loop)
+        @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=5, max=60))
+        def run_bot():
+            print("[Discord] Attempting to run bot")
+            try:
+                bot.run(DISCORD_BOT_TOKEN)
+            except discord.errors.LoginFailure as e:
+                print(f"[Discord] Login failed: Invalid DISCORD_BOT_TOKEN: {e}")
+                raise
+            except discord.errors.HTTPException as e:
+                print(f"[Discord] HTTP error during bot startup: {e}")
+                raise
+            except Exception as e:
+                print(f"[Discord] Unexpected error running bot: {e}")
+                raise
+        run_bot()
     except Exception as e:
-        print(f"[Discord] Failed to start bot: {e}")
-        raise
+        print(f"[Discord] Failed to start bot after retries: {e}")
 
 async def assign_or_remove_role(discord_id: str, plan: str, action: str):
     if plan not in PLAN_TO_ROLE:
@@ -250,12 +271,15 @@ def schedule_immediate_processing():
             print("[Scheduler] Bot ready, scheduling immediate processing")
             asyncio.run_coroutine_threadsafe(_wake_queue_once(), bot.loop)
         else:
-            print("[Scheduler] Bot not ready, scheduling deferred processing")
+            print("[Scheduler] Bot not ready, scheduling deferred processing on fallback loop")
             async def deferred_processing():
                 await bot.wait_until_ready()
                 print("[Scheduler] Bot ready, executing deferred processing")
                 await _wake_queue_once()
-            asyncio.run_coroutine_threadsafe(deferred_processing(), bot.loop)
+            future = asyncio.run_coroutine_threadsafe(deferred_processing(), fallback_loop)
+            if not fallback_loop.is_running():
+                threading.Thread(target=fallback_loop.run_forever, daemon=True).start()
+            future.result(timeout=10)
     except Exception as e:
         print(f"[Scheduler] Failed to schedule immediate processing: {e}")
 
@@ -314,7 +338,7 @@ def update_subscription_sheet(email, discord_id, plan, status, stripe_customer_i
             "discord_id": discord_id,
             "plan": plan,
             "status": status,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
             "stripe_customer_id": stripe_customer_id,
             "stripe_subscription_id": stripe_subscription_id,
             "coupon_id": coupon_id
@@ -491,10 +515,20 @@ def trigger_assignments():
     print("[Manual] Triggering manual assignment processing")
     try:
         if bot.is_ready():
+            print("[Manual] Bot ready, scheduling immediate processing")
             asyncio.run_coroutine_threadsafe(_wake_queue_once(), bot.loop)
             return jsonify({"status": "success", "message": "Triggered assignment processing"}), 200
         else:
-            return jsonify({"status": "error", "message": "Bot not ready, try again later"}), 503
+            print("[Manual] Bot not ready, using fallback loop for manual trigger")
+            async def manual_processing():
+                await bot.wait_until_ready()
+                print("[Manual] Bot ready, executing manual processing")
+                await _wake_queue_once()
+            future = asyncio.run_coroutine_threadsafe(manual_processing(), fallback_loop)
+            if not fallback_loop.is_running():
+                threading.Thread(target=fallback_loop.run_forever, daemon=True).start()
+            future.result(timeout=10)
+            return jsonify({"status": "success", "message": "Triggered assignment processing on fallback loop"}), 200
     except Exception as e:
         print(f"[Manual] Failed to trigger assignments: {e}")
         return jsonify({"status": "error", "message": f"Failed to trigger: {str(e)}"}), 500
@@ -509,14 +543,11 @@ def run_flask():
 
 if __name__ == "__main__":
     validate_env_vars()
-    # Start Discord bot with retries
-    bot_thread = threading.Thread(target=start_discord_bot, daemon=True)
     print("[Startup] Starting Discord bot thread")
+    bot_thread = threading.Thread(target=start_discord_bot, daemon=True)
     bot_thread.start()
-    # Wait longer to ensure bot initialization
-    time.sleep(15)
+    time.sleep(30)
     print("[Startup] Starting Flask thread")
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    # Keep main thread alive
     bot_thread.join()
