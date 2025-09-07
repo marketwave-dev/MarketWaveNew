@@ -28,14 +28,21 @@ ROLE_PLUS = int(os.getenv("ROLE_PLUS"))
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
+# Stripe config
+stripe.api_key = STRIPE_SECRET_KEY
+
+# Price mapping
+PLAN_TO_PRICE_ID = {
+    "5K to 50K Challenge": "price_1RdEoc08Ntv6wEBmUZOADdMd",
+    "MarketWave Elite": "price_1RdEob08Ntv6wEBmT27qALuM",
+    "MarketWave Plus": "price_1RdEoc08Ntv6wEBmifMeruFq"
+}
+
 # Flask app
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY
 
 limiter = Limiter(get_remote_address, app=app, default_limits=["100 per minute"])
-
-# Stripe config
-stripe.api_key = STRIPE_SECRET_KEY
 
 # Discord bot
 intents = discord.Intents.default()
@@ -44,7 +51,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Role mapping
 ROLE_MAP = {
-    "MarketWave 5K-50K": ROLE_5K_TO_50K,
+    "5K to 50K Challenge": ROLE_5K_TO_50K,
     "MarketWave Elite": ROLE_ELITE,
     "MarketWave Plus": ROLE_PLUS,
 }
@@ -199,14 +206,15 @@ def callback():
     email = user["email"]
     plan = session.get("plan")
 
+    price_id = PLAN_TO_PRICE_ID.get(plan)
+    if not price_id:
+        logger.error("[Stripe] No price ID mapped for plan %s", plan)
+        return "Plan not supported", 400
+
     checkout_session = stripe.checkout.Session.create(
         payment_method_types=["card"],
         line_items=[{
-            "price_data": {
-                "currency": "usd",
-                "product_data": {"name": plan},
-                "unit_amount": 1000,
-            },
+            "price": price_id,
             "quantity": 1,
         }],
         mode="subscription",
