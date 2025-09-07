@@ -218,6 +218,7 @@ def callback():
             "quantity": 1,
         }],
         mode="subscription",
+    	allow_promotion_codes=True,  
         success_url="https://example.com/success",
         cancel_url="https://example.com/cancel",
         metadata={"discord_id": discord_id, "email": email, "plan": plan},
