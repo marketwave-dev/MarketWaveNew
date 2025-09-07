@@ -1,7 +1,6 @@
 import os
 import logging
 import asyncio
-import aiohttp
 import requests
 import stripe
 from flask import Flask, request, redirect, session
@@ -10,6 +9,7 @@ from flask_limiter.util import get_remote_address
 from discord.ext import commands
 import discord
 from datetime import datetime
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(message)s')
@@ -70,39 +70,38 @@ ROLE_MAP = {
 }
 
 # --- Google Sheet Integration ---
-async def make_request(method, url, **kwargs):
-    async with aiohttp.ClientSession() as session:
-        for attempt in range(3):
-            try:
-                async with session.request(method, url, **kwargs) as response:
-                    response.raise_for_status()
-                    return await response.json()
-            except aiohttp.ClientResponseError as e:
-                if e.status == 429 and attempt < 2:
-                    logger.warning("Rate limit hit, retrying after %s seconds", 2 ** attempt)
-                    await asyncio.sleep(2 ** attempt)
-                else:
-                    raise
-            except Exception as e:
+def make_request(method, url, **kwargs):
+    for attempt in range(3):
+        try:
+            response = requests.request(method, url, **kwargs)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429 and attempt < 2:
+                logger.warning("Rate limit hit, retrying after %s seconds", 2 ** attempt)
+                time.sleep(2 ** attempt)
+            else:
                 raise
+        except Exception as e:
+            raise
 
-async def insert_assignment(data):
-    return await make_request("POST", GOOGLE_APPS_SCRIPT_URL, json={"action": "insert_assignment", "data": data})
+def insert_assignment(data):
+    return make_request("POST", GOOGLE_APPS_SCRIPT_URL, json={"action": "insert_assignment", "data": data})
 
-async def get_pending_assignments(limit=50):
-    return await make_request("GET", GOOGLE_APPS_SCRIPT_URL, params={"action": "get_pending_assignments", "limit": limit})
+def get_pending_assignments(limit=50):
+    return make_request("GET", GOOGLE_APPS_SCRIPT_URL, params={"action": "get_pending_assignments", "limit": limit})
 
-async def update_assignment(row_id, updates):
-    return await make_request("POST", GOOGLE_APPS_SCRIPT_URL, json={"action": "update_assignment", "row_id": row_id, "updates": updates})
+def update_assignment(row_id, updates):
+    return make_request("POST", GOOGLE_APPS_SCRIPT_URL, json={"action": "update_assignment", "row_id": row_id, "updates": updates})
 
-async def remove_assignment(row_id):
-    return await make_request("POST", GOOGLE_APPS_SCRIPT_URL, json={"action": "remove_assignment", "row_id": row_id})
+def remove_assignment(row_id):
+    return make_request("POST", GOOGLE_APPS_SCRIPT_URL, json={"action": "remove_assignment", "row_id": row_id})
 
-async def lookup_by_subscription_id(subscription_id):
-    return await make_request("GET", GOOGLE_APPS_SCRIPT_URL, params={"action": "lookup_by_subscription_id", "subscription_id": subscription_id})
+def lookup_by_subscription_id(subscription_id):
+    return make_request("GET", GOOGLE_APPS_SCRIPT_URL, params={"action": "lookup_by_subscription_id", "subscription_id": subscription_id})
 
-async def lookup_by_email(email):
-    return await make_request("GET", GOOGLE_APPS_SCRIPT_URL, params={"action": "lookup_by_email", "email": email})
+def lookup_by_email(email):
+    return make_request("GET", GOOGLE_APPS_SCRIPT_URL, params={"action": "lookup_by_email", "email": email})
 
 # --- Discord Role Management ---
 async def assign_role(discord_id, plan):
@@ -145,7 +144,7 @@ async def queue_processor_loop():
     while True:
         try:
             logger.info("[Worker] Polling pending assignments (interval=%ss)", backoff)
-            assignments = await get_pending_assignments(50)
+            assignments = await asyncio.to_thread(get_pending_assignments, 50)
             count = len(assignments.get("assignments", []))
             logger.info("[Worker] Retrieved %s assignments", count)
 
@@ -156,8 +155,8 @@ async def queue_processor_loop():
                     logger.warning("[Worker] Error processing row %s: %s", row.get("row_id"), e)
 
             backoff = 60  # Reset after success
-        except aiohttp.ClientResponseError as e:
-            if e.status == 429:
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
                 logger.warning("[Worker] Hit Google rate limit (429). Backing off...")
                 backoff = min(backoff * 2, max_backoff)
             else:
@@ -181,11 +180,11 @@ async def process_assignment(row):
             await remove_role(discord_id, plan)
         else:
             raise ValueError(f"Unknown action {action}")
-        await remove_assignment(row_id)
+        await asyncio.to_thread(remove_assignment, row_id)
         logger.info("[Worker] Completed row %s (%s %s)", row_id, action, plan)
     except Exception as e:
         logger.warning("[Worker] Failed row %s: %s (attempt %s)", row_id, e, attempts+1)
-        await update_assignment(row_id, {"attempts": "increment", "last_error": str(e)})
+        await asyncio.to_thread(update_assignment, row_id, {"attempts": "increment", "last_error": str(e)})
 
 # --- Flask Routes ---
 @app.route("/")
@@ -205,7 +204,7 @@ def login():
     )
 
 @app.route("/callback")
-async def callback():
+def callback():
     code = request.args.get("code")
     if not code:
         logger.error("[OAuth] Missing code parameter")
@@ -220,16 +219,20 @@ async def callback():
         "scope": "identify email",
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    async with aiohttp.ClientSession() as session:
-        async with session.post("https://discord.com/api/oauth2/token", data=data, headers=headers) as r:
-            r.raise_for_status()
-            credentials = await r.json()
-    
+    try:
+        r = requests.post("https://discord.com/api/oauth2/token", data=data, headers=headers)
+        r.raise_for_status()
+        credentials = r.json()
+    except requests.exceptions.RequestException as e:
+        logger.error("[OAuth] Error exchanging code for token: %s", e)
+        return "OAuth error", 400
+
     access_token = credentials["access_token"]
-    async with aiohttp.ClientSession() as session:
-        async with session.get("https://discord.com/api/users/@me", headers={"Authorization": f"Bearer {access_token}"}) as r:
-            r.raise_for_status()
-            user = await r.json()
+    try:
+        user = requests.get("https://discord.com/api/users/@me", headers={"Authorization": f"Bearer {access_token}"}).json()
+    except requests.exceptions.RequestException as e:
+        logger.error("[OAuth] Error fetching user info: %s", e)
+        return "OAuth error", 400
 
     discord_id = user["id"]
     email = user["email"]
@@ -252,8 +255,8 @@ async def callback():
             }],
             mode="subscription",
             allow_promotion_codes=True,
-            success_url="https://<your-domain>/success",  # Replace with your actual URL
-            cancel_url="https://<your-domain>/cancel",    # Replace with your actual URL
+            success_url="https://marketwavebot-f0tu.onrender.com/success",  # Updated
+            cancel_url="https://marketwavebot-f0tu.onrender.com/cancel",   # Updated
             metadata={"discord_id": discord_id, "email": email, "plan": plan},
         )
         logger.info("[Stripe] Created checkout session for %s plan=%s", discord_id, plan)
@@ -262,9 +265,17 @@ async def callback():
         logger.error("[Stripe] Error creating checkout session: %s", e)
         return "Payment error", 400
 
+@app.route("/success")
+def success():
+    return "Payment successful! Your subscription is being processed."
+
+@app.route("/cancel")
+def cancel():
+    return "Payment cancelled. Please try again."
+
 @app.route("/webhook", methods=["POST"])
 @limiter.limit("200 per minute")
-async def stripe_webhook():
+def stripe_webhook():
     payload = request.data
     sig_header = request.headers.get("Stripe-Signature")
     try:
@@ -282,7 +293,7 @@ async def stripe_webhook():
         plan = data["metadata"]["plan"]
         subscription_id = data.get("subscription")
 
-        await insert_assignment({
+        insert_assignment({
             "email": email,
             "discord_id": discord_id,
             "plan": plan,
@@ -297,9 +308,9 @@ async def stripe_webhook():
 
     elif event["type"] in ["customer.subscription.deleted", "invoice.payment_failed"]:
         subscription_id = event["data"]["object"]["id"]
-        sub_info = await lookup_by_subscription_id(subscription_id)
+        sub_info = lookup_by_subscription_id(subscription_id)
         if sub_info:
-            await insert_assignment({
+            insert_assignment({
                 "email": sub_info.get("email"),
                 "discord_id": sub_info.get("discord_id"),
                 "plan": sub_info.get("plan"),
