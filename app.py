@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+import aiohttp
 import requests
 import stripe
 from flask import Flask, request, redirect, session
@@ -13,6 +14,18 @@ from datetime import datetime
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
+
+# Validate environment variables
+REQUIRED_ENV_VARS = [
+    "DISCORD_BOT_TOKEN", "DISCORD_CLIENT_ID", "DISCORD_CLIENT_SECRET",
+    "DISCORD_GUILD_ID", "DISCORD_REDIRECT_URI", "FLASK_SECRET_KEY",
+    "GOOGLE_APPS_SCRIPT_URL", "ROLE_5K_TO_50K", "ROLE_ELITE", "ROLE_PLUS",
+    "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET"
+]
+for var in REQUIRED_ENV_VARS:
+    if not os.getenv(var):
+        logger.error("Missing environment variable: %s", var)
+        raise ValueError(f"Missing environment variable: {var}")
 
 # Load environment variables
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -57,35 +70,39 @@ ROLE_MAP = {
 }
 
 # --- Google Sheet Integration ---
-def insert_assignment(data):
-    r = requests.post(GOOGLE_APPS_SCRIPT_URL, json={"action": "insert_assignment", "data": data})
-    r.raise_for_status()
-    return r.json()
+async def make_request(method, url, **kwargs):
+    async with aiohttp.ClientSession() as session:
+        for attempt in range(3):
+            try:
+                async with session.request(method, url, **kwargs) as response:
+                    response.raise_for_status()
+                    return await response.json()
+            except aiohttp.ClientResponseError as e:
+                if e.status == 429 and attempt < 2:
+                    logger.warning("Rate limit hit, retrying after %s seconds", 2 ** attempt)
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    raise
+            except Exception as e:
+                raise
 
-def get_pending_assignments(limit=50):
-    r = requests.get(GOOGLE_APPS_SCRIPT_URL, params={"action": "get_pending_assignments", "limit": limit})
-    r.raise_for_status()
-    return r.json()
+async def insert_assignment(data):
+    return await make_request("POST", GOOGLE_APPS_SCRIPT_URL, json={"action": "insert_assignment", "data": data})
 
-def update_assignment(row_id, updates):
-    r = requests.post(GOOGLE_APPS_SCRIPT_URL, json={"action": "update_assignment", "row_id": row_id, "updates": updates})
-    r.raise_for_status()
-    return r.json()
+async def get_pending_assignments(limit=50):
+    return await make_request("GET", GOOGLE_APPS_SCRIPT_URL, params={"action": "get_pending_assignments", "limit": limit})
 
-def remove_assignment(row_id):
-    r = requests.post(GOOGLE_APPS_SCRIPT_URL, json={"action": "remove_assignment", "row_id": row_id})
-    r.raise_for_status()
-    return r.json()
+async def update_assignment(row_id, updates):
+    return await make_request("POST", GOOGLE_APPS_SCRIPT_URL, json={"action": "update_assignment", "row_id": row_id, "updates": updates})
 
-def lookup_by_subscription_id(subscription_id):
-    r = requests.get(GOOGLE_APPS_SCRIPT_URL, params={"action": "lookup_by_subscription_id", "subscription_id": subscription_id})
-    r.raise_for_status()
-    return r.json()
+async def remove_assignment(row_id):
+    return await make_request("POST", GOOGLE_APPS_SCRIPT_URL, json={"action": "remove_assignment", "row_id": row_id})
 
-def lookup_by_email(email):
-    r = requests.get(GOOGLE_APPS_SCRIPT_URL, params={"action": "lookup_by_email", "email": email})
-    r.raise_for_status()
-    return r.json()
+async def lookup_by_subscription_id(subscription_id):
+    return await make_request("GET", GOOGLE_APPS_SCRIPT_URL, params={"action": "lookup_by_subscription_id", "subscription_id": subscription_id})
+
+async def lookup_by_email(email):
+    return await make_request("GET", GOOGLE_APPS_SCRIPT_URL, params={"action": "lookup_by_email", "email": email})
 
 # --- Discord Role Management ---
 async def assign_role(discord_id, plan):
@@ -128,7 +145,7 @@ async def queue_processor_loop():
     while True:
         try:
             logger.info("[Worker] Polling pending assignments (interval=%ss)", backoff)
-            assignments = await asyncio.to_thread(get_pending_assignments, 50)
+            assignments = await get_pending_assignments(50)
             count = len(assignments.get("assignments", []))
             logger.info("[Worker] Retrieved %s assignments", count)
 
@@ -138,9 +155,9 @@ async def queue_processor_loop():
                 except Exception as e:
                     logger.warning("[Worker] Error processing row %s: %s", row.get("row_id"), e)
 
-            backoff = 60  # normal after success
-        except requests.exceptions.HTTPError as e:
-            if e.response is not None and e.response.status_code == 429:
+            backoff = 60  # Reset after success
+        except aiohttp.ClientResponseError as e:
+            if e.status == 429:
                 logger.warning("[Worker] Hit Google rate limit (429). Backing off...")
                 backoff = min(backoff * 2, max_backoff)
             else:
@@ -163,12 +180,12 @@ async def process_assignment(row):
         elif action == "remove":
             await remove_role(discord_id, plan)
         else:
-            raise ValueError(f"unknown action {action}")
-        remove_assignment(row_id)
+            raise ValueError(f"Unknown action {action}")
+        await remove_assignment(row_id)
         logger.info("[Worker] Completed row %s (%s %s)", row_id, action, plan)
     except Exception as e:
         logger.warning("[Worker] Failed row %s: %s (attempt %s)", row_id, e, attempts+1)
-        update_assignment(row_id, {"attempts": "increment", "last_error": str(e)})
+        await update_assignment(row_id, {"attempts": "increment", "last_error": str(e)})
 
 # --- Flask Routes ---
 @app.route("/")
@@ -178,6 +195,9 @@ def home():
 @app.route("/login")
 def login():
     plan = request.args.get("plan")
+    if not plan or plan not in PLAN_TO_PRICE_ID:
+        logger.error("[OAuth] Invalid or missing plan: %s", plan)
+        return "Invalid plan", 400
     session["plan"] = plan
     logger.info("[OAuth] Initiating for plan=%s", plan)
     return redirect(
@@ -185,8 +205,12 @@ def login():
     )
 
 @app.route("/callback")
-def callback():
+async def callback():
     code = request.args.get("code")
+    if not code:
+        logger.error("[OAuth] Missing code parameter")
+        return "Missing code", 400
+
     data = {
         "client_id": DISCORD_CLIENT_ID,
         "client_secret": DISCORD_CLIENT_SECRET,
@@ -196,44 +220,57 @@ def callback():
         "scope": "identify email",
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    r = requests.post("https://discord.com/api/oauth2/token", data=data, headers=headers)
-    r.raise_for_status()
-    credentials = r.json()
+    async with aiohttp.ClientSession() as session:
+        async with session.post("https://discord.com/api/oauth2/token", data=data, headers=headers) as r:
+            r.raise_for_status()
+            credentials = await r.json()
+    
     access_token = credentials["access_token"]
-    user = requests.get("https://discord.com/api/users/@me", headers={"Authorization": f"Bearer {access_token}"}).json()
+    async with aiohttp.ClientSession() as session:
+        async with session.get("https://discord.com/api/users/@me", headers={"Authorization": f"Bearer {access_token}"}) as r:
+            r.raise_for_status()
+            user = await r.json()
 
     discord_id = user["id"]
     email = user["email"]
     plan = session.get("plan")
+    if not plan:
+        logger.error("[Stripe] No plan in session for %s", discord_id)
+        return "No plan specified", 400
 
     price_id = PLAN_TO_PRICE_ID.get(plan)
     if not price_id:
         logger.error("[Stripe] No price ID mapped for plan %s", plan)
         return "Plan not supported", 400
 
-    checkout_session = stripe.checkout.Session.create(
-        payment_method_types=["card"],
-        line_items=[{
-            "price": price_id,
-            "quantity": 1,
-        }],
-        mode="subscription",
-    	allow_promotion_codes=True,  
-        success_url="https://example.com/success",
-        cancel_url="https://example.com/cancel",
-        metadata={"discord_id": discord_id, "email": email, "plan": plan},
-    )
-
-    logger.info("[Stripe] Created checkout session for %s plan=%s", discord_id, plan)
-    return redirect(checkout_session.url, code=303)
+    try:
+        checkout_session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            line_items=[{
+                "price": price_id,
+                "quantity": 1,
+            }],
+            mode="subscription",
+            allow_promotion_codes=True,
+            success_url="https://<your-domain>/success",  # Replace with your actual URL
+            cancel_url="https://<your-domain>/cancel",    # Replace with your actual URL
+            metadata={"discord_id": discord_id, "email": email, "plan": plan},
+        )
+        logger.info("[Stripe] Created checkout session for %s plan=%s", discord_id, plan)
+        return redirect(checkout_session.url, code=303)
+    except stripe.error.StripeError as e:
+        logger.error("[Stripe] Error creating checkout session: %s", e)
+        return "Payment error", 400
 
 @app.route("/webhook", methods=["POST"])
-def stripe_webhook():
+@limiter.limit("200 per minute")
+async def stripe_webhook():
     payload = request.data
     sig_header = request.headers.get("Stripe-Signature")
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except Exception as e:
+        logger.error("[Stripe] Webhook error: %s", e)
         return str(e), 400
 
     logger.info("[Stripe] Event: %s", event["type"])
@@ -245,7 +282,7 @@ def stripe_webhook():
         plan = data["metadata"]["plan"]
         subscription_id = data.get("subscription")
 
-        insert_assignment({
+        await insert_assignment({
             "email": email,
             "discord_id": discord_id,
             "plan": plan,
@@ -256,13 +293,13 @@ def stripe_webhook():
             "stripe_subscription_id": subscription_id,
             "created_at": datetime.utcnow().isoformat(),
         })
-        logger.info("[Sheets] inserted assignment row for %s", discord_id)
+        logger.info("[Sheets] Inserted assignment row for %s", discord_id)
 
     elif event["type"] in ["customer.subscription.deleted", "invoice.payment_failed"]:
         subscription_id = event["data"]["object"]["id"]
-        sub_info = lookup_by_subscription_id(subscription_id)
+        sub_info = await lookup_by_subscription_id(subscription_id)
         if sub_info:
-            insert_assignment({
+            await insert_assignment({
                 "email": sub_info.get("email"),
                 "discord_id": sub_info.get("discord_id"),
                 "plan": sub_info.get("plan"),
@@ -273,7 +310,7 @@ def stripe_webhook():
                 "stripe_subscription_id": subscription_id,
                 "created_at": datetime.utcnow().isoformat(),
             })
-            logger.info("[Sheets] queued removal for subscription %s", subscription_id)
+            logger.info("[Sheets] Queued removal for subscription %s", subscription_id)
 
     return "", 200
 
