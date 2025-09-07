@@ -176,12 +176,14 @@ async def process_assignment(row):
     try:
         if action == "assign":
             await assign_role(discord_id, plan)
+            await asyncio.to_thread(update_assignment, row_id, {"status": "assigned"})
+            logger.info("[Worker] Completed row %s (%s %s), set status to assigned", row_id, action, plan)
         elif action == "remove":
             await remove_role(discord_id, plan)
+            await asyncio.to_thread(update_assignment, row_id, {"status": "removed"})
+            logger.info("[Worker] Completed row %s (%s %s), set status to removed", row_id, action, plan)
         else:
             raise ValueError(f"Unknown action {action}")
-        await asyncio.to_thread(remove_assignment, row_id)
-        logger.info("[Worker] Completed row %s (%s %s)", row_id, action, plan)
     except Exception as e:
         logger.warning("[Worker] Failed row %s: %s (attempt %s)", row_id, e, attempts+1)
         await asyncio.to_thread(update_assignment, row_id, {"attempts": "increment", "last_error": str(e)})
@@ -255,8 +257,8 @@ def callback():
             }],
             mode="subscription",
             allow_promotion_codes=True,
-            success_url="https://marketwavebot-f0tu.onrender.com/success",  # Updated
-            cancel_url="https://marketwavebot-f0tu.onrender.com/cancel",   # Updated
+            success_url="https://marketwavebot-f0tu.onrender.com/success",
+            cancel_url="https://marketwavebot-f0tu.onrender.com/cancel",
             metadata={"discord_id": discord_id, "email": email, "plan": plan},
         )
         logger.info("[Stripe] Created checkout session for %s plan=%s", discord_id, plan)
