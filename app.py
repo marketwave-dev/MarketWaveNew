@@ -136,11 +136,10 @@ async def remove_role(discord_id, plan):
     await member.remove_roles(role)
     logger.info("[Discord] Removed role %s from %s", role.name, member.display_name)
 
-# --- Worker Loop with Backoff ---
+# --- Worker Loop ---
 async def queue_processor_loop():
     backoff = 15
     max_backoff = 300
-
     while True:
         try:
             logger.info("[Worker] Polling pending assignments (interval=%ss)", backoff)
@@ -154,7 +153,7 @@ async def queue_processor_loop():
                 except Exception as e:
                     logger.warning("[Worker] Error processing row %s: %s", row.get("row_id"), e)
 
-            backoff = 60  # Reset after success
+            backoff = 60
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 429:
                 logger.warning("[Worker] Hit Google rate limit (429). Backing off...")
@@ -237,7 +236,7 @@ def callback():
         return "OAuth error", 400
 
     discord_id = user["id"]
-    email = user["email"]
+    email = user.get("email")
     plan = session.get("plan")
     if not plan:
         logger.error("[Stripe] No plan in session for %s", discord_id)
@@ -251,15 +250,13 @@ def callback():
     try:
         checkout_session = stripe.checkout.Session.create(
             payment_method_types=["card"],
-            line_items=[{
-                "price": price_id,
-                "quantity": 1,
-            }],
+            line_items=[{"price": price_id, "quantity": 1}],
             mode="subscription",
             allow_promotion_codes=True,
             success_url="https://marketwavebot-f0tu.onrender.com/success",
             cancel_url="https://marketwavebot-f0tu.onrender.com/cancel",
-            metadata={"discord_id": discord_id, "email": email, "plan": plan},
+            metadata={"discord_id": discord_id, "email": email or "", "plan": plan},
+            customer_email=email if email else None,
         )
         logger.info("[Stripe] Created checkout session for %s plan=%s", discord_id, plan)
         return redirect(checkout_session.url, code=303)
@@ -290,10 +287,15 @@ def stripe_webhook():
 
     if event["type"] == "checkout.session.completed":
         data = event["data"]["object"]
-        discord_id = data["metadata"]["discord_id"]
-        email = data["metadata"]["email"]
-        plan = data["metadata"]["plan"]
+        metadata = data.get("metadata", {})
+        discord_id = metadata.get("discord_id")
+        email = metadata.get("email") or data.get("customer_details", {}).get("email")
+        plan = metadata.get("plan")
         subscription_id = data.get("subscription")
+
+        if not discord_id or not plan:
+            logger.error("[Stripe] Missing required metadata in checkout.session.completed")
+            return "Missing metadata", 400
 
         insert_assignment({
             "email": email,
