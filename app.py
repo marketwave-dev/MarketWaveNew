@@ -103,38 +103,46 @@ def lookup_by_subscription_id(subscription_id):
 def lookup_by_email(email):
     return make_request("GET", GOOGLE_APPS_SCRIPT_URL, params={"action": "lookup_by_email", "email": email})
 
-# --- Discord Role Management ---
-async def assign_role(discord_id, plan):
-    guild = bot.get_guild(DISCORD_GUILD_ID)
-    if not guild:
-        raise ValueError("Guild not found")
-    member = guild.get_member(int(discord_id))
-    if not member:
-        raise ValueError(f"Member {discord_id} not found")
-    role_id = ROLE_MAP.get(plan)
-    if not role_id:
-        raise ValueError(f"Plan {plan} not mapped to a role")
-    role = guild.get_role(role_id)
-    if not role:
-        raise ValueError(f"Role ID {role_id} not found in guild")
-    await member.add_roles(role)
-    logger.info("[Discord] Assigned role %s to %s", role.name, member.display_name)
+# --- Role Verification Helpers ---
+async def verify_role(member, role, should_have=True):
+    await asyncio.sleep(30)  # wait before checking
+    refreshed = member.guild.get_member(member.id)
+    if not refreshed:
+        return False
+    has_role = role in refreshed.roles
+    return has_role if should_have else not has_role
 
-async def remove_role(discord_id, plan):
+async def assign_role_with_check(discord_id, plan, retries=3):
     guild = bot.get_guild(DISCORD_GUILD_ID)
-    if not guild:
-        raise ValueError("Guild not found")
     member = guild.get_member(int(discord_id))
-    if not member:
-        raise ValueError(f"Member {discord_id} not found")
-    role_id = ROLE_MAP.get(plan)
-    if not role_id:
-        raise ValueError(f"Plan {plan} not mapped to a role")
-    role = guild.get_role(role_id)
-    if not role:
-        raise ValueError(f"Role ID {role_id} not found in guild")
-    await member.remove_roles(role)
-    logger.info("[Discord] Removed role %s from %s", role.name, member.display_name)
+    role = guild.get_role(ROLE_MAP[plan])
+
+    for attempt in range(1, retries + 1):
+        await member.add_roles(role)
+        logger.info("[Discord] Attempt %s: Assigned role %s to %s", attempt, role.name, member.display_name)
+        if await verify_role(member, role, should_have=True):
+            logger.info("[Discord] Verified role %s for %s", role.name, member.display_name)
+            return True
+        await asyncio.sleep(10 * attempt)  # backoff
+
+    logger.error("[Discord] Failed to assign role %s to %s after %s attempts", role.name, member.display_name, retries)
+    return False
+
+async def remove_role_with_check(discord_id, plan, retries=3):
+    guild = bot.get_guild(DISCORD_GUILD_ID)
+    member = guild.get_member(int(discord_id))
+    role = guild.get_role(ROLE_MAP[plan])
+
+    for attempt in range(1, retries + 1):
+        await member.remove_roles(role)
+        logger.info("[Discord] Attempt %s: Removed role %s from %s", attempt, role.name, member.display_name)
+        if await verify_role(member, role, should_have=False):
+            logger.info("[Discord] Verified removal of role %s from %s", role.name, member.display_name)
+            return True
+        await asyncio.sleep(10 * attempt)
+
+    logger.error("[Discord] Failed to remove role %s from %s after %s attempts", role.name, member.display_name, retries)
+    return False
 
 # --- Worker Loop ---
 async def queue_processor_loop():
@@ -173,18 +181,20 @@ async def process_assignment(row):
     attempts = int(row.get("attempts") or 0)
 
     try:
+        success = False
         if action == "assign":
-            await assign_role(discord_id, plan)
-            await asyncio.to_thread(update_assignment, row_id, {"status": "assigned"})
-            logger.info("[Worker] Completed row %s (%s %s), set status to assigned", row_id, action, plan)
+            success = await assign_role_with_check(discord_id, plan)
+            status = "assigned" if success else "failed"
         elif action == "remove":
-            await remove_role(discord_id, plan)
-            await asyncio.to_thread(update_assignment, row_id, {"status": "removed"})
-            logger.info("[Worker] Completed row %s (%s %s), set status to removed", row_id, action, plan)
+            success = await remove_role_with_check(discord_id, plan)
+            status = "removed" if success else "failed"
         else:
             raise ValueError(f"Unknown action {action}")
+
+        await asyncio.to_thread(update_assignment, row_id, {"status": status})
+        logger.info("[Worker] Row %s completed with status=%s", row_id, status)
     except Exception as e:
-        logger.warning("[Worker] Failed row %s: %s (attempt %s)", row_id, e, attempts+1)
+        logger.warning("[Worker] Failed row %s: %s (attempt %s)", row_id, e, attempts + 1)
         await asyncio.to_thread(update_assignment, row_id, {"attempts": "increment", "last_error": str(e)})
 
 # --- Flask Routes ---
