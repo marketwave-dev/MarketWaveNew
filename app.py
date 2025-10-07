@@ -10,18 +10,50 @@ from discord.ext import commands
 import discord
 from datetime import datetime
 import time
+from logging.handlers import SMTPHandler
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
+# Custom filter to ignore specific non-critical errors
+class IgnoreDiscordReconnectFilter(logging.Filter):
+    def filter(self, record):
+        ignored_phrases = [
+            "discord.errors.ConnectionClosed: Shard ID None WebSocket closed with 1000",
+            "Attempting a reconnect in"
+        ]
+        for phrase in ignored_phrases:
+            if phrase in record.msg:
+                return False
+        return True
+
+# Add SMTP handler for email logging on ERROR level and above
+root_logger = logging.getLogger()
+smtp_handler = SMTPHandler(
+    mailhost=(os.getenv("SMTP_SERVER"), int(os.getenv("SMTP_PORT", 587))),
+    fromaddr=os.getenv("EMAIL_USER"),
+    toaddrs=[os.getenv("ERROR_EMAIL_RECIPIENT")],
+    subject="Critical Error in MarketWave Bot",
+    credentials=(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASS")),
+    secure=() if os.getenv("SMTP_SECURE", "False").lower() == "true" else None
+)
+smtp_handler.setLevel(logging.ERROR)
+smtp_handler.addFilter(IgnoreDiscordReconnectFilter())
+root_logger.addHandler(smtp_handler)
+
+# Also add to discord logger to ensure propagation
+discord_logger = logging.getLogger('discord')
+discord_logger.addHandler(smtp_handler)
+
 # Validate environment variables
 REQUIRED_ENV_VARS = [
-    "DISCORD_BOT_TOKEN", "DISCORD_CLIENT_ID", "DISCORD_CLIENT_SECRET",
-    "DISCORD_GUILD_ID", "DISCORD_REDIRECT_URI", "FLASK_SECRET_KEY",
-    "GOOGLE_APPS_SCRIPT_URL", "ROLE_5K_TO_50K", "ROLE_ELITE", "ROLE_PLUS",
-    "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET"
+    "DISCORD_BOT_TOKEN", "DISCORD_CLIENT_ID", "DISCORD_CLIENT_SECRET", "DISCORD_GUILD_ID",
+    "DISCORD_REDIRECT_URI", "FLASK_SECRET_KEY", "GOOGLE_APPS_SCRIPT_URL", "ROLE_5K_TO_50K",
+    "ROLE_ELITE", "ROLE_PLUS", "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET",
+    "SMTP_SERVER", "SMTP_PORT", "EMAIL_USER", "EMAIL_PASS", "ERROR_EMAIL_RECIPIENT", "SMTP_SECURE"
 ]
+
 for var in REQUIRED_ENV_VARS:
     if not os.getenv(var):
         logger.error("Missing environment variable: %s", var)
@@ -54,7 +86,6 @@ PLAN_TO_PRICE_ID = {
 # Flask app
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY
-
 limiter = Limiter(get_remote_address, app=app, default_limits=["100 per minute"])
 
 # Discord bot
@@ -85,23 +116,30 @@ def make_request(method, url, **kwargs):
         except Exception as e:
             raise
 
+
 def insert_assignment(data):
     return make_request("POST", GOOGLE_APPS_SCRIPT_URL, json={"action": "insert_assignment", "data": data})
+
 
 def get_pending_assignments(limit=50):
     return make_request("GET", GOOGLE_APPS_SCRIPT_URL, params={"action": "get_pending_assignments", "limit": limit})
 
+
 def update_assignment(row_id, updates):
     return make_request("POST", GOOGLE_APPS_SCRIPT_URL, json={"action": "update_assignment", "row_id": row_id, "updates": updates})
+
 
 def remove_assignment(row_id):
     return make_request("POST", GOOGLE_APPS_SCRIPT_URL, json={"action": "remove_assignment", "row_id": row_id})
 
+
 def lookup_by_subscription_id(subscription_id):
     return make_request("GET", GOOGLE_APPS_SCRIPT_URL, params={"action": "lookup_by_subscription_id", "subscription_id": subscription_id})
 
+
 def lookup_by_email(email):
     return make_request("GET", GOOGLE_APPS_SCRIPT_URL, params={"action": "lookup_by_email", "email": email})
+
 
 # --- Role Verification Helpers ---
 async def verify_role(member, role, should_have=True):
@@ -112,37 +150,62 @@ async def verify_role(member, role, should_have=True):
     has_role = role in refreshed.roles
     return has_role if should_have else not has_role
 
+
 async def assign_role_with_check(discord_id, plan, retries=3):
     guild = bot.get_guild(DISCORD_GUILD_ID)
     member = guild.get_member(int(discord_id))
+    if member is None:
+        logger.error("[Discord] Member %s not found in guild", discord_id)
+        return False
     role = guild.get_role(ROLE_MAP[plan])
-
+    if role is None:
+        logger.error("[Discord] Role %s not found in guild", ROLE_MAP[plan])
+        return False
     for attempt in range(1, retries + 1):
-        await member.add_roles(role)
-        logger.info("[Discord] Attempt %s: Assigned role %s to %s", attempt, role.name, member.display_name)
+        try:
+            await member.add_roles(role)
+            logger.info("[Discord] Attempt %s: Assigned role %s to %s", attempt, role.name, member.display_name)
+        except discord.errors.Forbidden:
+            logger.error("[Discord] Forbidden to assign role %s to %s", role.name, member.display_name)
+            return False
+        except Exception as e:
+            logger.error("[Discord] Error assigning role: %s", e)
+            continue
         if await verify_role(member, role, should_have=True):
             logger.info("[Discord] Verified role %s for %s", role.name, member.display_name)
             return True
         await asyncio.sleep(10 * attempt)  # backoff
-
     logger.error("[Discord] Failed to assign role %s to %s after %s attempts", role.name, member.display_name, retries)
     return False
+
 
 async def remove_role_with_check(discord_id, plan, retries=3):
     guild = bot.get_guild(DISCORD_GUILD_ID)
     member = guild.get_member(int(discord_id))
+    if member is None:
+        logger.error("[Discord] Member %s not found in guild", discord_id)
+        return False
     role = guild.get_role(ROLE_MAP[plan])
-
+    if role is None:
+        logger.error("[Discord] Role %s not found in guild", ROLE_MAP[plan])
+        return False
     for attempt in range(1, retries + 1):
-        await member.remove_roles(role)
-        logger.info("[Discord] Attempt %s: Removed role %s from %s", attempt, role.name, member.display_name)
+        try:
+            await member.remove_roles(role)
+            logger.info("[Discord] Attempt %s: Removed role %s from %s", attempt, role.name, member.display_name)
+        except discord.errors.Forbidden:
+            logger.error("[Discord] Forbidden to remove role %s from %s", role.name, member.display_name)
+            return False
+        except Exception as e:
+            logger.error("[Discord] Error removing role: %s", e)
+            continue
         if await verify_role(member, role, should_have=False):
             logger.info("[Discord] Verified removal of role %s from %s", role.name, member.display_name)
             return True
         await asyncio.sleep(10 * attempt)
-
     logger.error("[Discord] Failed to remove role %s from %s after %s attempts", role.name, member.display_name, retries)
     return False
+
 
 # --- Worker Loop ---
 async def queue_processor_loop():
@@ -154,13 +217,11 @@ async def queue_processor_loop():
             assignments = await asyncio.to_thread(get_pending_assignments, 50)
             count = len(assignments.get("assignments", []))
             logger.info("[Worker] Retrieved %s assignments", count)
-
             for row in assignments.get("assignments", []):
                 try:
                     await process_assignment(row)
                 except Exception as e:
                     logger.warning("[Worker] Error processing row %s: %s", row.get("row_id"), e)
-
             backoff = 60
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 429:
@@ -170,8 +231,8 @@ async def queue_processor_loop():
                 logger.error("[Worker] HTTP error during poll: %s", e)
         except Exception as e:
             logger.error("[Worker] Unexpected loop error: %s", e, exc_info=True)
-
         await asyncio.sleep(backoff)
+
 
 async def process_assignment(row):
     discord_id = row.get("discord_id")
@@ -179,7 +240,6 @@ async def process_assignment(row):
     action = row.get("action")
     row_id = row.get("row_id")
     attempts = int(row.get("attempts") or 0)
-
     try:
         success = False
         if action == "assign":
@@ -190,17 +250,18 @@ async def process_assignment(row):
             status = "removed" if success else "failed"
         else:
             raise ValueError(f"Unknown action {action}")
-
         await asyncio.to_thread(update_assignment, row_id, {"status": status})
         logger.info("[Worker] Row %s completed with status=%s", row_id, status)
     except Exception as e:
         logger.warning("[Worker] Failed row %s: %s (attempt %s)", row_id, e, attempts + 1)
         await asyncio.to_thread(update_assignment, row_id, {"attempts": "increment", "last_error": str(e)})
 
+
 # --- Flask Routes ---
 @app.route("/")
 def home():
     return "Service is running"
+
 
 @app.route("/login")
 def login():
@@ -214,13 +275,13 @@ def login():
         f"https://discord.com/api/oauth2/authorize?client_id={DISCORD_CLIENT_ID}&redirect_uri={DISCORD_REDIRECT_URI}&response_type=code&scope=identify%20email"
     )
 
+
 @app.route("/callback")
 def callback():
     code = request.args.get("code")
     if not code:
         logger.error("[OAuth] Missing code parameter")
         return "Missing code", 400
-
     data = {
         "client_id": DISCORD_CLIENT_ID,
         "client_secret": DISCORD_CLIENT_SECRET,
@@ -237,26 +298,22 @@ def callback():
     except requests.exceptions.RequestException as e:
         logger.error("[OAuth] Error exchanging code for token: %s", e)
         return "OAuth error", 400
-
     access_token = credentials["access_token"]
     try:
         user = requests.get("https://discord.com/api/users/@me", headers={"Authorization": f"Bearer {access_token}"}).json()
     except requests.exceptions.RequestException as e:
         logger.error("[OAuth] Error fetching user info: %s", e)
         return "OAuth error", 400
-
     discord_id = user["id"]
     email = user.get("email")
     plan = session.get("plan")
     if not plan:
         logger.error("[Stripe] No plan in session for %s", discord_id)
         return "No plan specified", 400
-
     price_id = PLAN_TO_PRICE_ID.get(plan)
     if not price_id:
         logger.error("[Stripe] No price ID mapped for plan %s", plan)
         return "Plan not supported", 400
-
     try:
         checkout_session = stripe.checkout.Session.create(
             payment_method_types=["card"],
@@ -274,13 +331,16 @@ def callback():
         logger.error("[Stripe] Error creating checkout session: %s", e)
         return "Payment error", 400
 
+
 @app.route("/success")
 def success():
     return "Payment successful! Your subscription is being processed."
 
+
 @app.route("/cancel")
 def cancel():
     return "Payment cancelled. Please try again."
+
 
 @app.route("/webhook", methods=["POST"])
 @limiter.limit("200 per minute")
@@ -292,9 +352,7 @@ def stripe_webhook():
     except Exception as e:
         logger.error("[Stripe] Webhook error: %s", e)
         return str(e), 400
-
     logger.info("[Stripe] Event: %s", event["type"])
-
     if event["type"] == "checkout.session.completed":
         data = event["data"]["object"]
         metadata = data.get("metadata", {})
@@ -302,11 +360,9 @@ def stripe_webhook():
         email = metadata.get("email") or data.get("customer_details", {}).get("email")
         plan = metadata.get("plan")
         subscription_id = data.get("subscription")
-
         if not discord_id or not plan:
             logger.error("[Stripe] Missing required metadata in checkout.session.completed")
             return "Missing metadata", 400
-
         insert_assignment({
             "email": email,
             "discord_id": discord_id,
@@ -319,7 +375,6 @@ def stripe_webhook():
             "created_at": datetime.utcnow().isoformat(),
         })
         logger.info("[Sheets] Inserted assignment row for %s", discord_id)
-
     elif event["type"] in ["customer.subscription.deleted", "invoice.payment_failed"]:
         subscription_id = event["data"]["object"]["id"]
         sub_info = lookup_by_subscription_id(subscription_id)
@@ -336,14 +391,15 @@ def stripe_webhook():
                 "created_at": datetime.utcnow().isoformat(),
             })
             logger.info("[Sheets] Queued removal for subscription %s", subscription_id)
-
     return "", 200
+
 
 # --- Startup ---
 @bot.event
 async def on_ready():
     logger.info("[Discord] Logged in as %s (id=%s)", bot.user, bot.user.id)
     bot.loop.create_task(queue_processor_loop())
+
 
 if __name__ == "__main__":
     import threading
