@@ -11,6 +11,8 @@ import discord
 from datetime import datetime
 import time
 from logging.handlers import SMTPHandler
+import smtplib
+from email.mime.text import MIMEText
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(message)s')
@@ -72,6 +74,12 @@ ROLE_ELITE = int(os.getenv("ROLE_ELITE"))
 ROLE_PLUS = int(os.getenv("ROLE_PLUS"))
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+EMAIL_SENDER = os.getenv("EMAIL_USER")
+EMAIL_RECEIVER = os.getenv("ERROR_EMAIL_RECIPIENT")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASS")
+SMTP_SERVER = os.getenv("SMTP_SERVER")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+SMTP_SECURE = os.getenv("SMTP_SECURE", "False").lower() == "true"
 
 # Stripe config
 stripe.api_key = STRIPE_SECRET_KEY
@@ -99,6 +107,30 @@ ROLE_MAP = {
     "MarketWave Elite": ROLE_ELITE,
     "MarketWave Plus": ROLE_PLUS,
 }
+
+# --- Email Notification Function ---
+def send_notification_email(subject, body):
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = EMAIL_SENDER
+    msg['To'] = EMAIL_RECEIVER
+
+    try:
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as smtp:
+                if SMTP_SECURE:
+                    smtp.starttls()
+                smtp.login(EMAIL_SENDER, EMAIL_PASSWORD)
+                smtp.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
+        else:
+            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as smtp:
+                if SMTP_SECURE:
+                    smtp.starttls()
+                smtp.login(EMAIL_SENDER, EMAIL_PASSWORD)
+                smtp.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
+        logger.info("Notification email sent successfully: %s", subject)
+    except Exception as e:
+        logger.error("Failed to send notification email: %s", e)
 
 # --- Google Sheet Integration ---
 def make_request(method, url, **kwargs):
@@ -375,14 +407,21 @@ def stripe_webhook():
             "created_at": datetime.utcnow().isoformat(),
         })
         logger.info("[Sheets] Inserted assignment row for %s", discord_id)
+        # Send join notification email
+        subject = "New Member Joined"
+        body = f"A new member has joined:\n\nDiscord ID: {discord_id}\nEmail: {email}\nPlan: {plan}"
+        send_notification_email(subject, body)
     elif event["type"] in ["customer.subscription.deleted", "invoice.payment_failed"]:
         subscription_id = event["data"]["object"]["id"]
         sub_info = lookup_by_subscription_id(subscription_id)
         if sub_info:
+            discord_id = sub_info.get("discord_id")
+            email = sub_info.get("email")
+            plan = sub_info.get("plan")
             insert_assignment({
-                "email": sub_info.get("email"),
-                "discord_id": sub_info.get("discord_id"),
-                "plan": sub_info.get("plan"),
+                "email": email,
+                "discord_id": discord_id,
+                "plan": plan,
                 "status": "pending",
                 "action": "remove",
                 "attempts": 0,
@@ -391,6 +430,10 @@ def stripe_webhook():
                 "created_at": datetime.utcnow().isoformat(),
             })
             logger.info("[Sheets] Queued removal for subscription %s", subscription_id)
+            # Send leave notification email
+            subject = "Member Left"
+            body = f"A member has left:\n\nDiscord ID: {discord_id}\nEmail: {email}\nPlan: {plan}"
+            send_notification_email(subject, body)
     return "", 200
 
 
