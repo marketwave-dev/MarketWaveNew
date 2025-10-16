@@ -148,30 +148,23 @@ def make_request(method, url, **kwargs):
         except Exception as e:
             raise
 
-
 def insert_assignment(data):
     return make_request("POST", GOOGLE_APPS_SCRIPT_URL, json={"action": "insert_assignment", "data": data})
-
 
 def get_pending_assignments(limit=50):
     return make_request("GET", GOOGLE_APPS_SCRIPT_URL, params={"action": "get_pending_assignments", "limit": limit})
 
-
 def update_assignment(row_id, updates):
     return make_request("POST", GOOGLE_APPS_SCRIPT_URL, json={"action": "update_assignment", "row_id": row_id, "updates": updates})
-
 
 def remove_assignment(row_id):
     return make_request("POST", GOOGLE_APPS_SCRIPT_URL, json={"action": "remove_assignment", "row_id": row_id})
 
-
 def lookup_by_subscription_id(subscription_id):
     return make_request("GET", GOOGLE_APPS_SCRIPT_URL, params={"action": "lookup_by_subscription_id", "subscription_id": subscription_id})
 
-
 def lookup_by_email(email):
     return make_request("GET", GOOGLE_APPS_SCRIPT_URL, params={"action": "lookup_by_email", "email": email})
-
 
 # --- Role Verification Helpers ---
 async def verify_role(member, role, should_have=True):
@@ -181,7 +174,6 @@ async def verify_role(member, role, should_have=True):
         return False
     has_role = role in refreshed.roles
     return has_role if should_have else not has_role
-
 
 async def assign_role_with_check(discord_id, plan, retries=3):
     guild = bot.get_guild(DISCORD_GUILD_ID)
@@ -210,7 +202,6 @@ async def assign_role_with_check(discord_id, plan, retries=3):
     logger.error("[Discord] Failed to assign role %s to %s after %s attempts", role.name, member.display_name, retries)
     return False
 
-
 async def remove_role_with_check(discord_id, plan, retries=3):
     guild = bot.get_guild(DISCORD_GUILD_ID)
     member = guild.get_member(int(discord_id))
@@ -238,7 +229,6 @@ async def remove_role_with_check(discord_id, plan, retries=3):
     logger.error("[Discord] Failed to remove role %s from %s after %s attempts", role.name, member.display_name, retries)
     return False
 
-
 # --- Worker Loop ---
 async def queue_processor_loop():
     backoff = 15
@@ -265,7 +255,6 @@ async def queue_processor_loop():
             logger.error("[Worker] Unexpected loop error: %s", e, exc_info=True)
         await asyncio.sleep(backoff)
 
-
 async def process_assignment(row):
     discord_id = row.get("discord_id")
     plan = row.get("plan")
@@ -288,12 +277,27 @@ async def process_assignment(row):
         logger.warning("[Worker] Failed row %s: %s (attempt %s)", row_id, e, attempts + 1)
         await asyncio.to_thread(update_assignment, row_id, {"attempts": "increment", "last_error": str(e)})
 
+# --- Webhook-Triggered Processing ---
+async def process_pending_assignments():
+    try:
+        logger.info("[Webhook] Running delayed get_pending_assignments")
+        assignments = await asyncio.to_thread(get_pending_assignments, 50)
+        count = len(assignments.get("assignments", []))
+        logger.info("[Webhook] Retrieved %s assignments", count)
+        for row in assignments.get("assignments", []):
+            try:
+                await process_assignment(row)
+            except Exception as e:
+                logger.warning("[Webhook] Error processing row %s: %s", row.get("row_id"), e)
+    except requests.exceptions.HTTPError as e:
+        logger.error("[Webhook] HTTP error during get_pending_assignments: %s", e)
+    except Exception as e:
+        logger.error("[Webhook] Unexpected error in get_pending_assignments: %s", e, exc_info=True)
 
 # --- Flask Routes ---
 @app.route("/")
 def home():
     return "Service is running"
-
 
 @app.route("/login")
 def login():
@@ -306,7 +310,6 @@ def login():
     return redirect(
         f"https://discord.com/api/oauth2/authorize?client_id={DISCORD_CLIENT_ID}&redirect_uri={DISCORD_REDIRECT_URI}&response_type=code&scope=identify%20email"
     )
-
 
 @app.route("/callback")
 def callback():
@@ -363,16 +366,13 @@ def callback():
         logger.error("[Stripe] Error creating checkout session: %s", e)
         return "Payment error", 400
 
-
 @app.route("/success")
 def success():
     return "Payment successful! Your subscription is being processed."
 
-
 @app.route("/cancel")
 def cancel():
     return "Payment cancelled. Please try again."
-
 
 @app.route("/webhook", methods=["POST"])
 @limiter.limit("200 per minute")
@@ -411,6 +411,8 @@ def stripe_webhook():
         subject = "New Member Joined"
         body = f"A new member has joined:\n\nDiscord ID: {discord_id}\nEmail: {email}\nPlan: {plan}"
         send_notification_email(subject, body)
+        # Schedule get_pending_assignments after 1 minute
+        bot.loop.create_task(asyncio.sleep(60, result=process_pending_assignments()))
     elif event["type"] in ["customer.subscription.deleted", "invoice.payment_failed"]:
         subscription_id = event["data"]["object"]["id"]
         sub_info = lookup_by_subscription_id(subscription_id)
@@ -434,15 +436,15 @@ def stripe_webhook():
             subject = "Member Left"
             body = f"A member has left:\n\nDiscord ID: {discord_id}\nEmail: {email}\nPlan: {plan}"
             send_notification_email(subject, body)
+            # Schedule get_pending_assignments after 1 minute
+            bot.loop.create_task(asyncio.sleep(60, result=process_pending_assignments()))
     return "", 200
-
 
 # --- Startup ---
 @bot.event
 async def on_ready():
     logger.info("[Discord] Logged in as %s (id=%s)", bot.user, bot.user.id)
     bot.loop.create_task(queue_processor_loop())
-
 
 if __name__ == "__main__":
     import threading
