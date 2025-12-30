@@ -84,11 +84,20 @@ SMTP_SECURE = os.getenv("SMTP_SECURE", "False").lower() == "true"
 # Stripe config
 stripe.api_key = STRIPE_SECRET_KEY
 
-# Price mapping
+# Price mapping with monthly and yearly options
 PLAN_TO_PRICE_ID = {
-    "5K to 50K Challenge": "price_1RdEoc08Ntv6wEBmUZOADdMd",
-    "MarketWave Elite": "price_1RdEob08Ntv6wEBmT27qALuM",
-    "MarketWave Plus": "price_1RdEoc08Ntv6wEBmifMeruFq"
+    "5K to 50K Challenge": {
+        "monthly": "price_1Sk8NO08Ntv6wEBmlbDf53AA",
+        "yearly": "price_1Sk8NO08Ntv6wEBmyKsoTDt4"
+    },
+    "MarketWave Elite": {
+        "monthly": "price_1Sk8OX08Ntv6wEBmK4foLXqC",
+        "yearly": "price_1Sk8OX08Ntv6wEBm52WfcwAs"
+    },
+    "MarketWave Plus": {
+        "monthly": "price_1Sk8Nx08Ntv6wEBmGHDMiJf1",
+        "yearly": "price_1Sk8Nx08Ntv6wEBmLL28O6NB"
+    }
 }
 
 # Flask app
@@ -302,11 +311,13 @@ def home():
 @app.route("/login")
 def login():
     plan = request.args.get("plan")
-    if not plan or plan not in PLAN_TO_PRICE_ID:
-        logger.error("[OAuth] Invalid or missing plan: %s", plan)
-        return "Invalid plan", 400
+    interval = request.args.get("interval", "monthly")  # Default to monthly
+    if not plan or plan not in PLAN_TO_PRICE_ID or interval not in ["monthly", "yearly"]:
+        logger.error("[OAuth] Invalid or missing plan/interval: plan=%s, interval=%s", plan, interval)
+        return "Invalid plan or interval", 400
     session["plan"] = plan
-    logger.info("[OAuth] Initiating for plan=%s", plan)
+    session["interval"] = interval
+    logger.info("[OAuth] Initiating for plan=%s, interval=%s", plan, interval)
     return redirect(
         f"https://discord.com/api/oauth2/authorize?client_id={DISCORD_CLIENT_ID}&redirect_uri={DISCORD_REDIRECT_URI}&response_type=code&scope=identify%20email"
     )
@@ -343,13 +354,14 @@ def callback():
     discord_id = user["id"]
     email = user.get("email")
     plan = session.get("plan")
-    if not plan:
-        logger.error("[Stripe] No plan in session for %s", discord_id)
-        return "No plan specified", 400
-    price_id = PLAN_TO_PRICE_ID.get(plan)
+    interval = session.get("interval")
+    if not plan or not interval:
+        logger.error("[Stripe] No plan/interval in session for %s", discord_id)
+        return "No plan or interval specified", 400
+    price_id = PLAN_TO_PRICE_ID.get(plan, {}).get(interval)
     if not price_id:
-        logger.error("[Stripe] No price ID mapped for plan %s", plan)
-        return "Plan not supported", 400
+        logger.error("[Stripe] No price ID mapped for plan %s, interval %s", plan, interval)
+        return "Plan/interval not supported", 400
     try:
         checkout_session = stripe.checkout.Session.create(
             payment_method_types=["card"],
@@ -358,10 +370,10 @@ def callback():
             allow_promotion_codes=True,
             success_url="https://marketwavebot-f0tu.onrender.com/success",
             cancel_url="https://marketwavebot-f0tu.onrender.com/cancel",
-            metadata={"discord_id": discord_id, "email": email or "", "plan": plan},
+            metadata={"discord_id": discord_id, "email": email or "", "plan": plan, "interval": interval},
             customer_email=email if email else None,
         )
-        logger.info("[Stripe] Created checkout session for %s plan=%s", discord_id, plan)
+        logger.info("[Stripe] Created checkout session for %s plan=%s, interval=%s", discord_id, plan, interval)
         return redirect(checkout_session.url, code=303)
     except stripe.error.StripeError as e:
         logger.error("[Stripe] Error creating checkout session: %s", e)
