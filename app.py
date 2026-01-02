@@ -372,6 +372,14 @@ def callback():
             cancel_url="https://marketwavebot-f0tu.onrender.com/cancel",
             metadata={"discord_id": discord_id, "email": email or "", "plan": plan, "interval": interval},
             customer_email=email if email else None,
+            consent_collection={
+                "terms_of_service": "required"
+            },
+            custom_text={
+                "terms_of_service_acceptance": {
+                    "message": "I agree to the Terms of Service and understand that all sales are final with no refunds."
+                }
+            }
         )
         logger.info("[Stripe] Created checkout session for %s plan=%s, interval=%s", discord_id, plan, interval)
         return redirect(checkout_session.url, code=303)
