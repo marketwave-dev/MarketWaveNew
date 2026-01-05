@@ -377,7 +377,7 @@ def callback():
             },
             custom_text={
                 "terms_of_service_acceptance": {
-                    "message": "I agree to the Terms of Service and understand that all sales are final with no refunds."
+                    "message": "I agree to the [Terms of Service](https://www.marketwavetrading.com/join-the-wave) and understand that all sales are final with no refunds."
                 }
             }
         )
